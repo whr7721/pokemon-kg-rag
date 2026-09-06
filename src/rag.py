@@ -1,7 +1,7 @@
 ﻿import os
 from pathlib import Path
 from dotenv import load_dotenv
-from neo4j import GraphDatabase
+from neo4j import GraphDatabase, RoutingControl
 from neo4j_graphrag.retrievers import VectorCypherRetriever
 from neo4j_graphrag.llm import OpenAILLM
 from neo4j_graphrag.generation import GraphRAG, RagTemplate
@@ -20,6 +20,48 @@ RETURN node.text AS text,
        score AS score
 """
 
+SUBGRAPH_QUERIES = {
+    "Pokemon": """
+        MATCH (n:Pokemon {pokedex_id: $eid})
+        OPTIONAL MATCH (n)-[r:HAS_TYPE|HAS_ABILITY|BELONGS_TO_EGG_GROUP|BELONGS_TO_GENERATION|EVOLVES_TO]->(m)
+        WITH n, r, m
+        WHERE r IS NOT NULL
+        RETURN labels(n)[0] AS sl, coalesce(n.name_zh, n.name, '') AS sn,
+               type(r) AS rel,
+               labels(m)[0] AS tl,
+               coalesce(m.name_zh, m.name, toString(m.num), '') AS tn
+        UNION
+        MATCH (n:Pokemon {pokedex_id: $eid})
+        OPTIONAL MATCH (m)-[r:EVOLVES_TO]->(n)
+        WITH n, r, m
+        WHERE r IS NOT NULL
+        RETURN labels(n)[0] AS sl, coalesce(n.name_zh, n.name, '') AS sn,
+               type(r) AS rel,
+               labels(m)[0] AS tl,
+               coalesce(m.name_zh, m.name, toString(m.num), '') AS tn
+    """,
+    "Move": """
+        MATCH (n:Move {name_zh: $eid})
+        OPTIONAL MATCH (m)-[r:LEARNS_MOVE]->(n)
+        WITH n, r, m
+        WHERE r IS NOT NULL
+        RETURN labels(m)[0] AS sl, coalesce(m.name_zh, m.name, '') AS sn,
+               type(r) AS rel,
+               labels(n)[0] AS tl, coalesce(n.name_zh, n.name, '') AS tn
+        LIMIT 15
+    """,
+    "Ability": """
+        MATCH (n:Ability {name_zh: $eid})
+        OPTIONAL MATCH (m)-[r:HAS_ABILITY]->(n)
+        WITH n, r, m
+        WHERE r IS NOT NULL
+        RETURN labels(m)[0] AS sl, coalesce(m.name_zh, m.name, '') AS sn,
+               type(r) AS rel,
+               labels(n)[0] AS tl, coalesce(n.name_zh, n.name, '') AS tn
+        LIMIT 15
+    """,
+}
+
 def record_formatter(record):
     return RetrieverResultItem(
         content=record["text"],
@@ -36,6 +78,7 @@ def get_driver():
     return GraphDatabase.driver(
         os.getenv("NEO4J_URL"),
         auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD")),
+        notifications_disabled_classifications=["DEPRECATION"],
     )
 
 class PokemonGraphRAG:
@@ -91,6 +134,38 @@ class PokemonGraphRAG:
             if result.retriever_result else []
         )
         return {"answer": result.answer, "evidence": evidence}
+
+    def subgraph(self, items, limit=3):
+        nodes = {}
+        edges = []
+        for item in items[:limit]:
+            label = item["metadata"]["entity_label"]
+            eid = item["metadata"]["entity_id"]
+            query = SUBGRAPH_QUERIES.get(label)
+            if not query:
+                continue
+            records, _, _ = self.driver.execute_query(
+                query, {"eid": eid},
+                database_=self.db,
+                routing_=RoutingControl.READ,
+            )
+            for rec in records:
+                sn, sl, rel, tn, tl = rec["sn"], rec["sl"], rec["rel"], rec["tn"], rec["tl"]
+                if not tn:
+                    continue
+                sid = f"{sl}:{sn}"
+                tid = f"{tl}:{tn}"
+                nodes[sid] = {"id": sid, "label": sn, "group": sl}
+                nodes[tid] = {"id": tid, "label": tn, "group": tl}
+                edges.append({"from": sid, "to": tid, "label": rel})
+        seen = set()
+        unique_edges = []
+        for e in edges:
+            key = (e["from"], e["to"], e["label"])
+            if key not in seen:
+                seen.add(key)
+                unique_edges.append(e)
+        return {"nodes": list(nodes.values()), "edges": unique_edges}
 
     def close(self):
         self.driver.close()

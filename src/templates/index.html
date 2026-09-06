@@ -1,0 +1,82 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>宝可梦知识图谱 RAG</title>
+<script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<style>
+  :root { --bg:#f5f6f8; --card:#ffffff; --ink:#1f2933; --muted:#6b7280; --accent:#f5b301; --line:#e5e7eb; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--ink); }
+  header { background:var(--card); border-bottom:1px solid var(--line); padding:16px 24px; }
+  header h1 { margin:0; font-size:20px; letter-spacing:0; }
+  main { max-width:1100px; margin:24px auto; padding:0 20px; display:grid; gap:20px; }
+  .ask { display:flex; gap:10px; }
+  input[type=text] { flex:1; padding:12px 14px; border:1px solid var(--line); border-radius:8px; font-size:15px; }
+  button { background:var(--accent); border:none; color:#1f2933; padding:12px 18px; border-radius:8px; font-weight:600; cursor:pointer; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:18px; }
+  .panel h2 { margin:0 0 12px; font-size:14px; color:var(--muted); font-weight:600; }
+  #answer { white-space:pre-wrap; line-height:1.7; }
+  .evi { border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:10px; font-size:14px; }
+  .evi .meta { color:var(--muted); font-size:12px; margin-bottom:6px; }
+  #graph { height:420px; border:1px solid var(--line); border-radius:8px; background:#fafbfc; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  @media(max-width:820px){ .grid{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<header><h1>宝可梦知识图谱 RAG</h1></header>
+<main>
+  <div class="ask">
+    <input id="q" type="text" placeholder="例如：皮卡丘是什么属性？妙蛙种子最终进化成什么？">
+    <button id="go">提问</button>
+  </div>
+  <div class="panel">
+    <h2>回答</h2>
+    <div id="answer">请输入问题。</div>
+  </div>
+  <div class="grid">
+    <div class="panel">
+      <h2>证据片段</h2>
+      <div id="evidence"></div>
+    </div>
+    <div class="panel">
+      <h2>知识图谱子图</h2>
+      <div id="graph"></div>
+    </div>
+  </div>
+</main>
+<script>
+const net = new vis.Network(document.getElementById('graph'), {nodes:new vis.DataSet(), edges:new vis.DataSet()}, {
+  physics:true, nodes:{shape:'dot', size:22, font:{color:'#1f2933'}}, edges:{arrows:'to', font:{align:'middle'}}
+});
+function escapeHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function drawGraph(sg){
+  if(!sg) return;
+  net.setData({
+    nodes: new vis.DataSet((sg.nodes||[]).map(n=>({id:n.id,label:n.label,group:n.group}))),
+    edges: new vis.DataSet((sg.edges||[]).map(e=>({from:e.from,to:e.to,label:e.label})))
+  });
+}
+async function ask(){
+  const q=document.getElementById('q').value.trim();
+  if(!q) return;
+  document.getElementById('answer').textContent='思考中...';
+  document.getElementById('evidence').innerHTML='';
+  const res=await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});
+  const data=await res.json();
+  document.getElementById('answer').textContent=data.answer || data.error || '无回答';
+  const ev=document.getElementById('evidence');
+  (data.evidence||[]).forEach(e=>{
+    const d=document.createElement('div'); d.className='evi';
+    d.innerHTML=`<div class="meta">${escapeHtml(e.metadata.entity_label)} · ${escapeHtml(e.metadata.entity_name)} · score ${(e.metadata.score||0).toFixed(3)}</div><div>${escapeHtml(e.text)}</div>`;
+    ev.appendChild(d);
+  });
+  drawGraph(data.subgraph);
+}
+document.getElementById('go').onclick=ask;
+document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')ask();});
+</script>
+</body>
+</html>
