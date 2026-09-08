@@ -1,20 +1,16 @@
-﻿from dotenv import load_dotenv
-import os
-from neo4j import GraphDatabase
+# -*- coding: utf-8 -*-
+"""计数/对拍，经仓库内 common.neo_http。"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import neo_http  # noqa: E402
 
-load_dotenv()
-driver = GraphDatabase.driver(
-    os.getenv("NEO4J_URL"),
-    auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD")),
-)
+def main():
+    for label, rows in [("nodes", neo_http.query("MATCH (n) RETURN labels(n)[0] AS l, count(n) AS c ORDER BY c DESC")),
+                        ("rels", neo_http.query("MATCH ()-[x]->() RETURN type(x) AS t, count(x) AS c ORDER BY c DESC"))]:
+        print("==", label.upper(), "==")
+        for r in rows:
+            print(f"{r[0]:24} {r[1]}")
 
-with driver.session(database=os.getenv("NEO4J_DB")) as session:
-    print("=== NODES ===")
-    for record in session.run("MATCH (n) RETURN labels(n)[0] AS label, count(n) AS c ORDER BY c DESC"):
-        print(f"{record['label']:12} {record['c']}")
-
-    print("=== RELATIONSHIPS ===")
-    for record in session.run("MATCH ()-[r]->() RETURN type(r) AS rel, count(r) AS c ORDER BY c DESC"):
-        print(f"{record['rel']:24} {record['c']}")
-
-driver.close()
+if __name__ == "__main__":
+    main()
