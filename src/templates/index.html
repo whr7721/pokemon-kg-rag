@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -15,6 +15,7 @@
   .ask { display:flex; gap:10px; }
   input[type=text] { flex:1; padding:12px 14px; border:1px solid var(--line); border-radius:8px; font-size:15px; }
   button { background:var(--accent); border:none; color:#1f2933; padding:12px 18px; border-radius:8px; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.6; cursor:not-allowed; }
   .panel { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:18px; }
   .panel h2 { margin:0 0 12px; font-size:14px; color:var(--muted); font-weight:600; }
   #answer { white-space:pre-wrap; line-height:1.7; }
@@ -23,18 +24,39 @@
   #graph { height:420px; border:1px solid var(--line); border-radius:8px; background:#fafbfc; }
   .grid { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
   @media(max-width:820px){ .grid{grid-template-columns:1fr;} }
+  /* 示例问题快捷入口 */
+  .chips { display:flex; flex-wrap:wrap; gap:8px; }
+  .chip { background:#fff; border:1px solid var(--line); color:var(--ink); padding:6px 12px; border-radius:999px; font-size:13px; font-weight:400; }
+  .chip:hover { border-color:var(--accent); color:#8a6100; }
+  /* 错误提示条 */
+  .errbar { display:flex; align-items:center; justify-content:space-between; gap:12px; background:#fef2f2; border:1px solid #fecaca; color:#b91c1c; padding:10px 14px; border-radius:8px; font-size:14px; }
+  .errbar button { background:none; border:none; color:#b91c1c; font-size:16px; font-weight:700; padding:0 2px; }
+  .errbar[hidden] { display:none; }
+  /* loading 转圈 */
+  .spin { display:inline-block; width:14px; height:14px; border:2px solid #d1d5db; border-top-color:var(--accent); border-radius:50%; animation:rot .8s linear infinite; vertical-align:-2px; margin-right:8px; }
+  @keyframes rot { to { transform:rotate(360deg); } }
+  /* 子图节点类型图例 */
+  .legend { display:flex; flex-wrap:wrap; gap:14px; padding:6px 2px 10px; font-size:12px; color:var(--muted); }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:4px; vertical-align:-1px; }
 </style>
 </head>
 <body>
 <header><h1>宝可梦知识图谱 RAG</h1></header>
 <main>
-  <div class="ask">
-    <input id="q" type="text" placeholder="例如：皮卡丘是什么属性？妙蛙种子最终进化成什么？">
-    <button id="go">提问</button>
+  <div id="errbar" class="errbar" hidden>
+    <span id="errtext"></span>
+    <button id="errclose" title="关闭">✕</button>
+  </div>
+  <div>
+    <div class="ask">
+      <input id="q" type="text" placeholder="例如：皮卡丘是什么属性？妙蛙种子最终进化成什么？">
+      <button id="go">提问</button>
+    </div>
+    <div class="chips" id="chips" style="margin-top:10px;"></div>
   </div>
   <div class="panel">
     <h2>回答</h2>
-    <div id="answer">请输入问题。</div>
+    <div id="answer">请输入问题，或点击下方示例问题快速体验。</div>
   </div>
   <div class="grid">
     <div class="panel">
@@ -43,37 +65,96 @@
     </div>
     <div class="panel">
       <h2>知识图谱子图</h2>
+      <div class="legend" id="legend"></div>
       <div id="graph"></div>
     </div>
   </div>
 </main>
 <script>
+/* 节点类型 → 颜色（与 vis groups 配置一致） */
+const NODE_COLORS = {
+  Pokemon:    '#f59e0b',
+  Move:       '#3b82f6',
+  Ability:    '#10b981',
+  Type:       '#8b5cf6',
+  EggGroup:   '#ec4899',
+  Generation: '#64748b',
+};
+const NODE_ZH = {
+  Pokemon:'宝可梦', Move:'招式', Ability:'特性', Type:'属性', EggGroup:'蛋群', Generation:'世代',
+};
 const net = new vis.Network(document.getElementById('graph'), {nodes:new vis.DataSet(), edges:new vis.DataSet()}, {
-  physics:true, nodes:{shape:'dot', size:22, font:{color:'#1f2933'}}, edges:{arrows:'to', font:{align:'middle'}}
+  physics:true,
+  groups:NODE_COLORS,
+  nodes:{shape:'dot', size:22, font:{color:'#1f2933'}},
+  edges:{arrows:'to', font:{align:'middle'}}
 });
-function escapeHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+/* 图例：只展示配置过的类型 */
+Object.keys(NODE_COLORS).forEach(g=>{
+  const s=document.createElement('span');
+  s.innerHTML=`<i style="background:${NODE_COLORS[g]}"></i>${NODE_ZH[g]||g}`;
+  document.getElementById('legend').appendChild(s);
+});
+function escapeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function drawGraph(sg){
-  if(!sg) return;
+  const empty={nodes:new vis.DataSet(), edges:new vis.DataSet()};
+  if(!sg){ net.setData(empty); return; }
   net.setData({
     nodes: new vis.DataSet((sg.nodes||[]).map(n=>({id:n.id,label:n.label,group:n.group}))),
     edges: new vis.DataSet((sg.edges||[]).map(e=>({from:e.from,to:e.to,label:e.label})))
   });
 }
+function showError(msg){ document.getElementById('errtext').textContent=msg; document.getElementById('errbar').hidden=false; }
+function hideError(){ document.getElementById('errbar').hidden=true; }
+document.getElementById('errclose').onclick=hideError;
+/* 示例问题：覆盖属性/招式/特性/进化/克制五类，与评测问题集对齐 */
+const EXAMPLES=[
+  '皮卡丘是什么属性？',
+  '妙蛙种子最终进化成什么？',
+  '十万伏特是什么属性的招式？',
+  '静电这个特性有什么效果？',
+  '电属性克制哪些属性？',
+];
+EXAMPLES.forEach(q=>{
+  const b=document.createElement('button'); b.className='chip'; b.textContent=q;
+  b.onclick=()=>{ document.getElementById('q').value=q; ask(); };
+  document.getElementById('chips').appendChild(b);
+});
+let busy=false;
 async function ask(){
+  if(busy) return;
   const q=document.getElementById('q').value.trim();
   if(!q) return;
-  document.getElementById('answer').textContent='思考中...';
-  document.getElementById('evidence').innerHTML='';
-  const res=await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});
-  const data=await res.json();
-  document.getElementById('answer').textContent=data.answer || data.error || '无回答';
-  const ev=document.getElementById('evidence');
-  (data.evidence||[]).forEach(e=>{
-    const d=document.createElement('div'); d.className='evi';
-    d.innerHTML=`<div class="meta">${escapeHtml(e.metadata.entity_label)} · ${escapeHtml(e.metadata.entity_name)} · score ${(e.metadata.score||0).toFixed(3)}</div><div>${escapeHtml(e.text)}</div>`;
-    ev.appendChild(d);
-  });
-  drawGraph(data.subgraph);
+  busy=true;
+  const btn=document.getElementById('go'), ans=document.getElementById('answer'), ev=document.getElementById('evidence');
+  btn.disabled=true; btn.textContent='查询中…';
+  hideError();
+  ans.innerHTML='<span class="spin"></span>正在检索知识图谱并生成回答，约需数秒…';
+  ev.innerHTML='';
+  drawGraph(null);
+  const ctl=new AbortController();
+  const timer=setTimeout(()=>ctl.abort(), 90000);
+  try{
+    const res=await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q}),signal:ctl.signal});
+    if(!res.ok) throw new Error('服务返回 '+res.status);
+    const data=await res.json();
+    if(data.error) throw new Error(data.error);
+    ans.textContent=data.answer || '无回答';
+    (data.evidence||[]).forEach(e=>{
+      const d=document.createElement('div'); d.className='evi';
+      d.innerHTML=`<div class="meta">${escapeHtml(e.metadata.entity_label)} · ${escapeHtml(e.metadata.entity_name)} · score ${(e.metadata.score||0).toFixed(3)}</div><div>${escapeHtml(e.text)}</div>`;
+      ev.appendChild(d);
+    });
+    drawGraph(data.subgraph);
+  }catch(err){
+    showError(err.name==='AbortError'
+      ? '请求超时（90 秒）：检索或生成耗时过长，请稍后重试。'
+      : '请求失败：'+(err.message||'网络错误')+'。请检查后端服务是否已启动，然后重试。');
+    ans.textContent='本次未能获取回答，请重试。';
+  }finally{
+    clearTimeout(timer);
+    busy=false; btn.disabled=false; btn.textContent='提问';
+  }
 }
 document.getElementById('go').onclick=ask;
 document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')ask();});
