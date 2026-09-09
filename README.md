@@ -88,6 +88,7 @@ python src\app.py                          # Web 演示
 
 - `v0.1-graph` / `v0.2-chunks` / `v0.3-rag` / `v0.4-web` / `v0.5-docs`
 - `stage1-final`：阶段一多分支合入的最终版本
+- `v0.6-stage1`：阶段一 9/10 汇报最终基线（已合入 `master`）
 
 ## 已知边界
 

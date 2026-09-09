@@ -1,7 +1,7 @@
 # 阶段一最终版集成说明
 
 > 更新：2026-09-09
-> 分支：`stage1-final`（以 `master` 为基座）
+> 分支：`master` / tag `v0.6-stage1`（由 `stage1-final` 合入）
 > 目标：把 `master`、`member1`、`member1-1`、`feat/retrieval`、`feat/生成评测` 合为一份可在 9/10 汇报使用的代码基线。
 
 ## 1. 分支贡献与合入内容
@@ -46,7 +46,7 @@ python src\app.py
 - [x] 组内 Aura 已按增强 Schema 全量导入，并补齐 `Chunk -[:DESCRIBES]-> 实体`。
 - [x] 已重跑 `scripts/smoke_rag.py` / `smoke_multiqa.py`（14/14）/ `smoke_ask.py`。
 - [ ] 重跑 `scripts/compare_rag.py`，把最后一轮答案/5 题对比更新到 `docs/evaluation.md`。
-- [ ] 在阶段一汇报前由小组 review `stage1-final`，再把合入结果打到 `master` 并打新 tag（建议 `v0.6-stage1`）。
+- [x] 小组已 review `stage1-final`，并把合入结果打到 `master`、打 tag `v0.6-stage1`。
 - [ ] 每次里程碑后做阶段性 `git commit` + `git tag` + 推 Gitee；小组成员用分支开发，不要直接改 `master`。
 
 ## 5. 当前明确边界
@@ -66,4 +66,4 @@ git commit -m "feat(memberX): 说明本次改动"
 git push -u origin memberX-stage1
 ```
 
-不要 `git push` 到 `master`。合入由组长在 `stage1-final` 上 review 后统一执行。
+不要 `git push` 到 `master`。阶段一已由 `stage1-final` 合入 `master`；后续继续按分支开发、review 后合入。
