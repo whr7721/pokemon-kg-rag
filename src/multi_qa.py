@@ -430,6 +430,9 @@ class MultiQA:
     def answer_counter(self, question: str):
         sp = self.species_in(question)
         if not sp:
+            if any(t in question for t in TYPES18):
+                # 纯“属性克制哪些属性”类问题没有目标宝可梦，交给 GraphRAG 的 Type 事实路径。
+                return None
             return {"kind": "counter", "ok": False, "answer": "未识别到目标宝可梦"}
         target = sp[-1]
         chart = self.type_chart()

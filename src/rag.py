@@ -132,6 +132,23 @@ SUBGRAPH_QUERIES = {
                labels(n)[0] AS tl, coalesce(n.name_zh, '') AS tn
         LIMIT 15
     """,
+    "Type": """
+        MATCH (n:Type {id: $eid})
+        OPTIONAL MATCH (n)-[h:HITS_TYPE]->(m:Type)
+        WITH n, h, m
+        WHERE h IS NOT NULL
+        RETURN labels(n)[0] AS sl, coalesce(n.name_zh, '') AS sn,
+               type(h) AS rel,
+               labels(m)[0] AS tl, coalesce(m.name_zh, '') AS tn
+        UNION
+        MATCH (n:Type {id: $eid})
+        OPTIONAL MATCH (p:Type)-[r:HITS_TYPE]->(n)
+        WITH n, r, p
+        WHERE r IS NOT NULL
+        RETURN labels(p)[0] AS sl, coalesce(p.name_zh, '') AS sn,
+               type(r) AS rel,
+               labels(n)[0] AS tl, coalesce(n.name_zh, '') AS tn
+    """,
 }
 
 ENTITY_FACT_QUERIES = {

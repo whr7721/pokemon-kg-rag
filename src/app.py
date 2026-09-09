@@ -54,13 +54,14 @@ def ask():
 
     structured = mqa.answer(question)
     if structured is not None:
+        evidence = rag.retrieve(question, top_k=top_k)
         return jsonify({
             "question": question,
             "answer": structured["answer"],
             "mode": structured["kind"],
             "facts": [],
-            "evidence": [],
-            "subgraph": {"nodes": [], "edges": []},
+            "evidence": evidence,
+            "subgraph": rag.subgraph(evidence, limit=3),
         })
 
     result = rag.ask(question, top_k=top_k, use_graph=use_graph)
