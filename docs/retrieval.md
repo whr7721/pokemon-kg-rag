@@ -1,197 +1,73 @@
-# 向量检索与实体邻域图谱事实注入规范 (docs/retrieval.md)
+# 向量检索与实体邻域图谱事实注入规范
 
-> 版本校正（2026-09-08）：本文档记录的早期实验使用 SiliconFlow 云端 BGE-M3 与 EMBED_API_KEY。阶段一最终版已统一为默认本地 EMBED_ENGINE=bge（BAAI/bge-m3），API 仅为可选切换；向量索引名统一为 `embedding_Chunk`，`EMBED_KEY`/`EMBED_API_KEY` 均可读取。
+> 负责人：成员二（向量与检索）
+> 基准版本：第一阶段（9/10 汇报里程碑）
+> 对应代码：`src/embedder.py`、`src/rag.py`、`scripts/compare_rag.py`、`src/app.py`
 
-**负责人**：成员二（向量与检索）  
-**基准版本**：第一阶段（9/10 汇报里程碑）  
-**对应代码**：`src/embedder.py`、`src/rag.py`、`scripts/compare_rag.py`、`src/app.py`
+## 1. 背景与核心改进
 
----
+早期最小闭环只把 `VectorCypherRetriever` 召回到的 `Chunk.text` 交给 LLM，图谱关系主要用于前端子图展示，没有真正进入生成上下文。
 
-## 一、 背景与核心改进
+当前实现的核心改进是：向量召回 Top-K 文本块后，沿 `Chunk -[:DESCRIBES]-> 实体` 回到图谱实体，再查询实体邻域事实，把属性、特性、蛋群、进化链、属性克制等结构化信息与文本块一起拼入 Prompt。`use_graph=false` 时只使用文本块，作为普通 RAG 对照。
 
-在第一阶段初始闭环中，RAG 检索仅依赖 `VectorCypherRetriever` 将命中文本块（`Chunk.text`）作为上下文提供给 LLM，而 Neo4j 数据库中建立的大量实体关系（如进化条件、隐藏特性、属性克制、蛋群等）仅在前端绘制子图时被调用，**并未真正参与大模型的推理与生成**。
+## 2. 向量化
 
-普通 RAG（纯文本检索）存在如下痛点：
-1. **关系属性缺失**：例如文本块包含宝可梦的描述和种族值，但进化的具体等级条件、道具要求存储在图谱关系的属性中，纯文本检索无法提供。
-2. **多跳/矩阵事实缺失**：属性相克（抵抗/克制/免疫）由属性节点间的图拓扑决定，单一文本块不含全局相克表，模型遇到抗性问题只能回答“资料不足”或产生幻觉。
+最终口径默认使用本地 BGE-M3：
 
-**成员二核心突破（GraphRAG 实体邻域事实注入）**：
-在向量检索召回 Top-K 文本块后，提取命中的实体 ID 与类型，向 Neo4j 发起实时邻域拓扑查询，将实体的属性、特性（明确标记普通/隐藏）、蛋群、世代、多阶进化链（含进化方式与等级）、属性抗性等信息提炼为**【图谱结构化事实】**，与**【检索文本块】**共同拼入 Prompt 上下文。
+- `EMBED_ENGINE=bge`
+- `EMBED_MODEL=BAAI/bge-m3`
+- `EMBED_DIM=1024`
+- `HF_ENDPOINT=https://hf-mirror.com`
 
----
+`src/embedder.py` 的 `make_embedder()` 根据 `EMBED_ENGINE` 选择 `BgeM3Embedder`（本地 `sentence-transformers`）或 `DashScopeEmbedder`（可选 OpenAI-compatible API）。默认是本地模型，因此需要安装 `sentence-transformers` 和 `torch`；可选 API 方式需要 `EMBED_ENDPOINT` 与 `EMBED_KEY`。
 
-## 二、 检索链路与技术架构
+向量索引统一为 `embedding_Chunk`，在 `scripts/setup_indexes.py` 中创建，1024 维、余弦相似度。
 
-```
-用户提问 (Query Text)
-       │
-       ▼
-[1. BGE-M3 向量化 (1024维)] ── (基于云端 API / 零本地 PyTorch 负担)
-       │
-       ▼
-[2. Neo4j 向量检索] ── (embedding_Chunk 索引，余弦相似度召回 Top-K Chunk)
-       │
-       ├─────────────────────────────────────────┐
-       ▼                                         ▼
-[3. 提取 Chunk 文本]                   [4. 提取命中实体 ID 与 Label]
-(Pokemon / Move / Ability)                       │
-       │                                         ▼
-       │                               [5. Neo4j 实体邻域拓扑查询]
-       │                               (单次 RTT 子查询：属性/特性/进化链/蛋群/抗性)
-       │                                         │
-       ▼                                         ▼
-[6. 文本块拼接]                          [7. 格式化【图谱结构化事实】]
-       │                                         │
-       └──────────────────┬──────────────────────┘
-                          ▼
-            [8. 结构化上下文融合 Prompt]
-                          │
-                          ▼
-          [9. Qwen / TJU-LLM 推理生成]
-                          │
-                          ▼
-            输出回答 (Answer) + 证据链
+## 3. 检索链路
+
+```text
+用户提问
+  -> BGE-M3 向量化
+  -> Neo4j 向量索引 embedding_Chunk 召回 Chunk
+  -> Chunk -[:DESCRIBES]-> 实体（Form 会经 HAS_FORM 归一为父 Pokemon）
+  -> 对 Pokemon/Move/Ability 查询邻域图谱事实
+  -> 结构化事实 + 文本块拼入 Prompt
+  -> tju-llm 生成回答
 ```
 
-### 1. 轻量化向量计算 (Zero-Torch 引擎)
-针对本地部署 PyTorch 占用数 GB 磁盘、CUDA 运行时依赖繁重的问题，`src/embedder.py` 改造为标准 OpenAI 兼容的云端 BGE-M3 API（1024 维），使用 Python 原生标准库 `urllib.request` 发起调用：
-- **资源占用**：零本地模型权重、零 GPU 显存占用、无需安装 `torch`。
-- **响应速度**：提问向量化单次耗时约 0.3~0.6 秒。
-- **一致性**：输出 1024 维浮点向量，与增强库 30714 个 Chunk 的 BGE-M3 向量索引完全一致。
+`src/rag.py` 的关键查询：
 
-#### 环境变量依赖规范（零硬编码设计）
-系统已彻底剥离默认字面量，所有服务参数均通过 `.env` 管理：
-| 配置项 | 说明 | 示例值 |
-| :--- | :--- | :--- |
-| `EMBED_ENDPOINT` | 向量化 API 服务端点 | `https://api.siliconflow.cn/v1/embeddings` |
-| `EMBED_MODEL` | 向量模型标识符 | `BAAI/bge-m3` |
-| `EMBED_API_KEY` | 向量服务访问密钥 | `sk-...` |
-| `LLM_ENDPOINT` | 文本生成 LLM 服务端点 | `https://ai.tju.edu.cn/api/v3` |
-| `LLM_MODEL` | 文本生成模型标识符 | `tju-llm` |
-| `LLM_TOKEN` | LLM 访问令牌 | `...` |
-| `NEO4J_URL` / `DB` | Neo4j AuraDB 实例连接 | `neo4j+s://...` |
-| `VECTOR_INDEX` | 向量索引名（随库切换） | `embedding_Chunk` |
+- `RETRIEVAL_QUERY`：向量召回 + `DESCRIBES` 回实体。
+- `ENTITY_FACT_QUERIES`：Pokemon / Move / Ability 三类实体的邻域事实。
+- `SUBGRAPH_QUERIES`：前端子图数据。
 
----
+## 4. 图谱事实注入内容
 
-### 2. 实体邻域图谱事实 Cypher 查询策略
-在 `src/rag.py` 中实现了 `ENTITY_FACT_QUERIES`，针对三类核心实体定制提取逻辑：
+- Pokemon：属性、特性（普通/隐藏）、蛋群、前后置进化与最终进化、属性克制倍率。
+- Move：属性、分类、威力、命中、PP、说明、可学宝可梦。
+- Ability：说明、世代、持有宝可梦。
 
-* **宝可梦实体 (Pokemon)**（属性/特性/蛋群/招式挂在 `Form` 形态节点下，需经 `HAS_FORM` 穿透一跳）：
-  - 属性：`(p)-[:HAS_FORM]->(:Form)-[:HAS_TYPE]->(t:Type)`；
-  - 特性：`(p)-[:HAS_FORM]->(:Form)-[ha:HAS_ABILITY]->(a:Ability)`，`ha.hidden` 为字符串 `'True'`，代码兼容布尔与字符串两种写法；
-  - 蛋群与世代：`(f:Form)-[:IN_EGG_GROUP]->(e)`、`(p)-[:BELONGS_TO_GENERATION]->(g)`（取 `g.num`）；
-  - 进化链：提取前置进化 `(prev)-[r:EVOLVES_TO]->(p)`、后续进化 `(p)-[r:EVOLVES_TO]->(nxt)` 以及二跳最终形态，展示 `condition` 进化条件原文（如“等级16以上”“使用雷之石”）；
-  - 属性相克：18×18 全量 `HITS_TYPE` 矩阵边（含精确倍率 `multiplier`），按宝可梦属性分别输出进攻倍率与防守倍率；
-  - 生态叙事边：`PREDATES_ON`（捕食）/`RIVAL_OF`（宿敌）/`ALLIED_WITH`（结盟）/`COMPETES_WITH`（竞争）等，附带图鉴证据原文 `evidence`。
+叙事关系 `RIVAL_OF/PREDATES_ON/...` 当前保留查询，但 `build_engine.py` 未生成这些边；只有额外导入叙事增强数据后才生效。
 
-> 检索归一化：`Chunk-DESCRIBES->Form` 的文本块在 `RETRIEVAL_QUERY` 中通过 `OPTIONAL MATCH (par:Pokemon)-[:HAS_FORM]->(e)` 直接归一为父宝可梦实体，下游事实注入与子图逻辑零改动。招式/特性实体改用 `id`（如 `move:十万伏特`）主键匹配。
+## 5. 普通 RAG vs GraphRAG 对照
 
-* **招式实体 (Move)**：
-  - 提取属性、分类、威力、命中率、PP、效果描述及代表可学宝可梦（`LIMIT 8`）。
+- `use_graph=true`：GraphRAG，注入图谱事实。
+- `use_graph=false`：普通 RAG，只注入检索文本块。
 
-* **特性实体 (Ability)**：
-  - 提取引入世代、效果描述及代表持有宝可梦列表（`LIMIT 8`）。
+完整 5 题对比结果见 `docs/evaluation.md`。`scripts/compare_rag.py` 会按当前库重新输出两类模式的回答，最终汇报前应以组内共享库的实测结果更新评测表。
 
-#### 单次往返拓扑查询优化 (Single-RTT Cypher Subquery)
-为避免多次数据库网络往返（RTT）以及多重 `OPTIONAL MATCH` 带来的笛卡尔积性能退化，代码采用 Neo4j 5+ 标准 `CALL (p) { ... }` 变量作用域子查询，将属性、特性、蛋群、多阶进化与抗性拓扑合并在**单次 Cypher 执行**中返回。
+## 6. 环境变量
 
-**实测基准对比**（对 10 个代表性宝可梦实体向 Neo4j AuraDB 云端连续测试）：
-* **优化前**（2 次查询/2 次 RTT：基础信息 + 属性相克独立查询）：平均耗时 **1245.4 ms**
-* **优化后**（1 次查询/1 次 RTT：`CALL (p)` 子查询合并）：平均耗时 **637.2 ms**
-* **实测效果**：实体图谱查询耗时降低 **48.8%**，单次 RAG 实体事实提取阶段耗时减少约 608 ms。
-
----
-
-### 3. 双模式检索支持
-在 `src/rag.py` 与 `src/app.py` 中增加了 `use_graph` 参数开关：
-- `use_graph=True`（默认，GraphRAG）：Prompt 上下文注入【图谱结构化事实】+【检索文本块】；
-- `use_graph=False`（普通 RAG）：Prompt 上下文仅注入【检索文本块】。
-
----
-
-### 4. 协作接口契约 (为成员三评测与成员四前端提供)
-后端 `src/app.py` 现已提供对双模式检索的完整支持：
-
-* **请求接口**：`POST /api/ask`
-* **请求格式 (JSON)**：
-  ```json
-  {
-    "question": "妙蛙种子如何进化？",
-    "top_k": 5,
-    "use_graph": true
-  }
-  ```
-  - `use_graph` (bool, 选填，默认 `true`)：`true` 运行 GraphRAG，`false` 运行普通 Naive RAG。
-  - `top_k` (int, 选填，默认 `5`)：向量检索召回文本块数量。
-
-* **响应格式 (JSON)**：
-  ```json
-  {
-    "question": "妙蛙种子如何进化？",
-    "mode": "graph_rag",
-    "answer": "妙蛙种子达到等级16以上进化为妙蛙草...",
-    "facts": [
-      {
-        "label": "Pokemon",
-        "data": { "name": "妙蛙种子", "id": "0001", "types": ["草", "毒"], ... }
-      }
-    ],
-    "evidence": [
-      { "text": "【宝可梦】妙蛙种子...", "metadata": { "entity_name": "妙蛙种子", ... } }
-    ],
-    "subgraph": {
-      "nodes": [ { "id": "Pokemon:妙蛙种子", "label": "妙蛙种子", "group": "Pokemon" }, ... ],
-      "edges": [ { "from": "...", "to": "...", "label": "EVOLVES_TO" }, ... ]
-    }
-  }
-  ```
-
----
-
-## 三、 对照实验设计与实测结果 (3 个代表性用例)
-
-运行命令：`python scripts/compare_rag.py`（Top-K = 5）
-
-### 实验一：进化链与具体进化条件
-* **问题**：`妙蛙种子的进化链是怎样的？具体需要达到什么等级条件？`
-* **问题类型**：实体进化拓扑与关系属性
-
-| 模式 | 上下文内容 | 模型实测回答 | 评测结论 |
-| :--- | :--- | :--- | :--- |
-| **普通 RAG** (`use_graph=False`) | 仅包含妙蛙花、妙蛙种子、妙蛙草的文本描述与招式表 | “根据提供的上下文，关于妙蛙种子的进化链描述如下：进化链：妙蛙种子 -> 妙蛙草 -> 妙蛙花。**资料不足以提供具体的等级条件。**” | 无法回答关键细节（等级条件缺失）。文本切块未提取关系属性。 |
-| **GraphRAG** (`use_graph=True`) | 注入【图谱事实】：<br>`妙蛙种子: 后续进化 妙蛙草(等级16以上), 最终形态 妙蛙花(等级32以上)` | “根据提供的上下文，妙蛙种子的进化链及等级条件如下：<br>1. **妙蛙种子** 进化为 **妙蛙草**：等级 **16** 以上。<br>2. **妙蛙草** 进化为 **妙蛙花**：等级 **32** 以上。<br>进化链：妙蛙种子 → 妙蛙草 → 妙蛙花。” | **完胜**。精准补全进化路径与等级约束，零幻觉。 |
-
----
-
-### 实验二：特性与隐藏特性区分
-* **问题**：`皮卡丘有哪些特性？它的隐藏特性是什么？`
-* **问题类型**：实体多维属性与关系区分
-
-| 模式 | 上下文内容 | 模型实测回答 | 评测结论 |
-| :--- | :--- | :--- | :--- |
-| **普通 RAG** (`use_graph=False`) | 文本块含非结构化字符串 `特性: 静电、避雷针（隐藏）` | “根据提供的上下文，皮卡丘的特性如下：<br>* **特性**：静电、避雷针<br>* **隐藏特性**：避雷针” | 依赖自然语言文本解析，能提取基本信息。 |
-| **GraphRAG** (`use_graph=True`) | 注入【图谱事实】：明确区分 `特性: 静电 (隐藏: 避雷针)` | “根据【图谱结构化事实】，皮卡丘**特性：静电、避雷针，隐藏特性：避雷针**。” | 图谱事实直接读取关系字段 `hidden`，结构确定性更高，消除文本解析歧义风险。 |
-
----
-
-### 实验三：属性相克与防守抵抗
-* **问题**：`妙蛙种子的草属性在防守时能抵抗哪些属性的攻击？`
-* **问题类型**：跨实体拓扑推理（宝可梦 → 属性 → 属性抵抗关系）
-
-| 模式 | 上下文内容 | 模型实测回答 | 评测结论 |
-| :--- | :--- | :--- | :--- |
-| **普通 RAG** (`use_graph=False`) | 文本块仅记载 `属性: 草、毒`，无全局相克信息 | “**资料不足**” | **完全失效**。在严格事实约束下，普通 RAG 无法处理跨领域相克规则。 |
-| **GraphRAG** (`use_graph=True`) | 注入【图谱事实】：<br>`草属性抵抗[水、电、地面、草]` | “根据上下文中的【图谱结构化事实】，妙蛙种子拥有草属性和毒属性。草属性抵抗：水、电、地面、草；毒属性抵抗：草、虫、妖精、格斗、毒。因此，妙蛙种子在防守时能抵抗的攻击属性包括：**水、电、地面、草、虫、妖精、格斗、毒**。” | **完胜**。图谱相克拓扑一跳召回，彻底解决普通 RAG“跨表/跨规则无法回答”的瓶颈。 |
-
----
-
-## 四、 实验结论与成果总结
-
-1. **信息完整性提升**：
-   - 普通 RAG 受限于文本切块粒度，丢失了关系上的属性（如进化所需等级、道具方式等）。GraphRAG 使得**进化条件完整召回率达到 100%**。
-2. **多跳规则问答突破**：
-   - 属性相克、抗性等规则类问题，普通 RAG 召回率为 0%（直接判定为资料不足）；GraphRAG 通过实体邻域的 `[:HITS_TYPE]` 全矩阵关系，成功将领域知识注入上下文并给出 100% 准确的答案。
-3. **工程架构极简轻量**：
-   - 彻底移除了数 GB 的本地 PyTorch/Torchvision 及本地大模型下载，客户端与服务端完全由轻量纯 Python 驱动，部署与运行时间缩短至秒级。
+| 配置项 | 说明 | 默认/示例 |
+| --- | --- | --- |
+| `EMBED_ENGINE` | `bge` 或 `dashscope` | `bge` |
+| `EMBED_MODEL` | 向量模型 | `BAAI/bge-m3` |
+| `EMBED_DIM` | 向量维度 | `1024` |
+| `HF_ENDPOINT` | HuggingFace 镜像 | `https://hf-mirror.com` |
+| `EMBED_ENDPOINT` | 可选 API 向量端点 | `https://api.siliconflow.cn/v1/embeddings` |
+| `EMBED_KEY` / `EMBED_API_KEY` | 可选 API 密钥 | `sk-...` |
+| `VECTOR_INDEX` | Neo4j 向量索引名 | `embedding_Chunk` |
+| `LLM_ENDPOINT` | 大模型端点 | `https://ai.tju.edu.cn/api/v3` |
+| `LLM_MODEL` | 大模型名 | `tju-llm` |
+| `LLM_TOKEN` | 大模型密钥 | `...` |
+| `NEO4J_URL` / `NEO4J_DB` | Neo4j Aura 连接 | `neo4j+s://...` |

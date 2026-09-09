@@ -11,6 +11,9 @@ def main():
         print("==", label.upper(), "==")
         for r in rows:
             print(f"{r[0]:24} {r[1]}")
+    print("== SPECIAL ==")
+    print(f"{'DESCRIBES':24} {neo_http.scalar('MATCH (:Chunk)-[:DESCRIBES]->() RETURN count(*)')}")
+    print(f"{'ChunkWithEmbedding':24} {neo_http.scalar('MATCH (c:Chunk) WHERE c.embedding IS NOT NULL RETURN count(c)')}")
 
 if __name__ == "__main__":
     main()

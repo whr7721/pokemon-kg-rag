@@ -1,23 +1,47 @@
 # -*- coding: utf-8 -*-
-"""索引：向量/唯一约束，经仓库内 common.neo_http。"""
+"""索引：向量/唯一约束。
+
+注意：Aura 的 HTTP Query API 对 DDL 会返回成功但不生效，因此这里改用
+neo4j 官方驱动（Bolt）执行，与 src/rag.py 的读取通道一致。
+"""
+import os
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from common import neo_http  # noqa: E402
+
+from dotenv import load_dotenv  # noqa: E402
+from neo4j import GraphDatabase  # noqa: E402
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 STEPS = [
+    "DROP INDEX chunk_embedding IF EXISTS",
     "CREATE VECTOR INDEX embedding_Chunk IF NOT EXISTS FOR (c:Chunk) ON (c.embedding) OPTIONS {indexConfig: {`vector.dimensions`: 1024, `vector.similarity_function`: 'cosine'}}",
     "CREATE CONSTRAINT pokemon_id IF NOT EXISTS FOR (p:Pokemon) REQUIRE p.pokedex_id IS UNIQUE",
     "CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.chunk_id IS UNIQUE",
 ]
 
+
 def main():
-    for s in STEPS:
-        try:
-            neo_http.query(s)
-            print("OK:", s[:70])
-        except Exception as e:
-            print("跳过:", str(e)[:100])
+    driver = GraphDatabase.driver(
+        os.getenv("NEO4J_URL"),
+        auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD")),
+    )
+    db = os.getenv("NEO4J_DB", "neo4j")
+    try:
+        with driver.session(database=db) as session:
+            for s in STEPS:
+                session.run(s).consume()
+                print("OK:", s[:70])
+            names = [r["name"] for r in session.run(
+                "SHOW INDEXES YIELD name WHERE name IN $names RETURN name",
+                names=["embedding_Chunk", "pokemon_id", "chunk_id"],
+            )]
+        print("已确认索引/约束:", ", ".join(names))
+    finally:
+        driver.close()
+
 
 if __name__ == "__main__":
     main()

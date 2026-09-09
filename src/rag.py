@@ -72,9 +72,9 @@ SUBGRAPH_QUERIES = {
                coalesce(m.name_zh, m.id, '') AS tn
         UNION
         MATCH (n:Pokemon {pokedex_id: $eid})
-        OPTIONAL MATCH (n)-[r:PREDATES_ON|RIVAL_OF|ALLIED_WITH|COMPETES_WITH|COMMENSAL_OF|MENTOR_OF|SYMBIOTIC_WITH]->(m:Pokemon)
+        OPTIONAL MATCH (n)-[r]->(m:Pokemon)
         WITH n, r, m
-        WHERE r IS NOT NULL
+        WHERE r IS NOT NULL AND type(r) IN ['PREDATES_ON','RIVAL_OF','ALLIED_WITH','COMPETES_WITH','COMMENSAL_OF','MENTOR_OF','SYMBIOTIC_WITH']
         RETURN labels(n)[0] AS sl, coalesce(n.name_zh, '') AS sn,
                type(r) AS rel,
                labels(m)[0] AS tl, coalesce(m.name_zh, '') AS tn
@@ -120,10 +120,6 @@ ENTITY_FACT_QUERIES = {
             RETURN [x IN collect(DISTINCT e.name_zh) WHERE x IS NOT NULL] AS egg_groups
         }
         CALL (p) {
-            OPTIONAL MATCH (p)-[:BELONGS_TO_GENERATION]->(g:Generation)
-            RETURN g.num AS generation
-        }
-        CALL (p) {
             OPTIONAL MATCH (prev:Pokemon)-[r_prev:EVOLVES_TO]->(p)
             OPTIONAL MATCH (p)-[r_next:EVOLVES_TO]->(nxt:Pokemon)
             OPTIONAL MATCH (p)-[:EVOLVES_TO]->(:Pokemon)-[r_final:EVOLVES_TO]->(final:Pokemon)
@@ -132,11 +128,12 @@ ENTITY_FACT_QUERIES = {
                    [x IN collect(DISTINCT {final: final.name_zh, condition: r_final.condition}) WHERE x.final IS NOT NULL] AS final_evolution
         }
         CALL (p) {
-            OPTIONAL MATCH (p)-[r_narr:PREDATES_ON|RIVAL_OF|ALLIED_WITH|COMPETES_WITH|COMMENSAL_OF|MENTOR_OF|SYMBIOTIC_WITH]->(other:Pokemon)
-            RETURN [x IN collect(DISTINCT {rel: type(r_narr), other: other.name_zh, evidence: r_narr.evidence})
+            OPTIONAL MATCH (p)-[r_narr]->(other:Pokemon)
+            WHERE type(r_narr) IN ['PREDATES_ON','RIVAL_OF','ALLIED_WITH','COMPETES_WITH','COMMENSAL_OF','MENTOR_OF','SYMBIOTIC_WITH']
+            RETURN [x IN collect(DISTINCT {rel: type(r_narr), other: other.name_zh, evidence: properties(r_narr).evidence})
                     WHERE x.other IS NOT NULL] AS narrative
         }
-        RETURN p.name_zh AS name, p.pokedex_id AS id, p.category AS category, generation,
+        RETURN p.name_zh AS name, p.pokedex_id AS id, p.category AS category,
                types, type_chart, abilities, egg_groups, evolves_from, evolves_to, final_evolution, narrative
     """,
     "Move": """
@@ -270,7 +267,7 @@ class PokemonGraphRAG:
             return ""
         if label == "Pokemon":
             types_str = " / ".join(rec.get("types") or [])
-            lines = [f"【宝可梦】{rec.get('name')}(编号:{rec.get('id')}) 属性:{types_str} 分类:{rec.get('category','')} 第{rec.get('generation','')}世代"]
+            lines = [f"【宝可梦】{rec.get('name')}(编号:{rec.get('id')}) 属性:{types_str} 分类:{rec.get('category','')}"]
             if rec.get("abilities"):
                 lines.append("  * 特性: " + "、".join(
                     f"{a['name']}(隐藏)" if str(a.get("hidden")) == "True" else a['name']

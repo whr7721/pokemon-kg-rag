@@ -53,6 +53,7 @@ python scripts\load_engine_out.py --clean  # 显式清空当前 Neo4j 库并导�
 python scripts\embed_vectors.py            # 本地 BGE-M3 向量化
 python scripts\setup_indexes.py            # 向量/约束索引
 python scripts\check_graph.py              # 图计数校验
+python scripts\smoke_rag.py               # 向量召回冒烟
 python scripts\smoke_multiqa.py            # 结构化问答金标
 python scripts\compare_rag.py              # RAG vs GraphRAG 对照实验
 python src\app.py                          # Web 演示
@@ -70,11 +71,11 @@ python src\app.py                          # Web 演示
 - `Chunk`：`chunk_id` 唯一键，保存 `text/kind/entity_type/entity_id/embedding`，经 `DESCRIBES` 指向实体。
 - 主要关系：`HAS_FORM`、`HAS_TYPE`、`HAS_ABILITY`、`IN_EGG_GROUP`、`LEARNS`、`EVOLVES_TO`、`HITS_TYPE`、`TYPE_MOD`、`IN_DEX`。
 
-当前数据集的确定性产物基线（以实际运行 `check_graph.py` 为准）：
+当前数据集的确定性产物基线（以实际运行 `check_graph.py` 为准；原始 JSONL 含少量同名重复，导入按 id 去重）：
 
-- 节点：Pokemon 1025 / Form 1320 / Move 953 / Ability 322 / Type 18 / EggGroup 16 / RegionDex 24
-- 关系：LEARNS 82833 / IN_DEX 5973 / HAS_ABILITY 2866 / HAS_TYPE 2064 / IN_EGG_GROUP 1671 / HAS_FORM 1320 / EVOLVES_TO 485 / HITS_TYPE 324 / TYPE_MOD 22
-- 文本块：30781 个 entity Chunk
+- 节点：Pokemon 1025 / Form 1320 / Move 935 / Ability 318 / Type 18 / EggGroup 16 / RegionDex 24 / Chunk 30728
+- 关系：LEARNS 82833 / IN_DEX 5973 / HAS_ABILITY 2866 / HAS_TYPE 2064 / IN_EGG_GROUP 1671 / HAS_FORM 1320 / EVOLVES_TO 485 / HITS_TYPE 324 / TYPE_MOD 22 / DESCRIBES 30728
+- 文本块：30728 个 entity Chunk
 
 ## API
 
@@ -98,7 +99,7 @@ python src\app.py                          # Web 演示
 ```text
 data/raw/data/     原始 JSON 数据集
 common/            轻量 Neo4j Query API 客户端
-docs/              进度、Schema、检索与评测文档
+docs/              进度、Schema、检索与评测文档（含 graph_schema.md）
 scripts/           校验、建索引、向量化、冒烟与对照脚本
 src/               核心代码与 Flask 应用
 src/templates/     前端页面

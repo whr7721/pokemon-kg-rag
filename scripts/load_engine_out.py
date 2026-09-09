@@ -44,6 +44,47 @@ def iter_jsonl(path):
                 yield json.loads(line)
 
 
+def load_entity_ids(entity_dir):
+    """Read entity id -> label mapping from entity JSONL files."""
+    id_label = {}
+    for path in sorted(entity_dir.glob("entity_*.jsonl")):
+        label = path.stem.replace("entity_", "")
+        for row in iter_jsonl(path):
+            id_label[row["id"]] = label
+    return id_label
+
+
+def load_unique_rows(path, key="id"):
+    """Keep only the last occurrence of each key (same as MERGE + SET)."""
+    by_id = {}
+    for row in iter_jsonl(path):
+        by_id[row[key]] = row
+    return list(by_id.values())
+
+
+def load_chunk_rows(chunk_path):
+    return load_unique_rows(chunk_path, key="id")
+
+
+def push_describes(session, chunk_rows, id_label):
+    """Rebuild Chunk -> entity DESCRIBES edges by entity_type/entity_id."""
+    by_label = {}
+    for c in chunk_rows:
+        if id_label.get(c.get("entity_id")) == c.get("entity_label"):
+            by_label.setdefault(c["entity_label"], []).append(c)
+    for lbl, rows in by_label.items():
+        sub = [{"chunk_id": c["id"], "entity_id": c["entity_id"]} for c in rows]
+        run_in_batches(
+            session,
+            "UNWIND $rows AS row "
+            f"MATCH (c:Chunk {{chunk_id: row.chunk_id}}), (t:`{lbl}` {{id: row.entity_id}}) "
+            "MERGE (c)-[:DESCRIBES]->(t)",
+            sub,
+            BATCH_CHUNKS,
+        )
+        print(f"Chunk DESCRIBES -> {lbl}: {len(sub)}")
+
+
 def prop_value(v):
     if v is None or isinstance(v, str) or isinstance(v, bool) or isinstance(v, (int, float)):
         return v
@@ -63,6 +104,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(ROOT / "build_out"))
     ap.add_argument("--clean", action="store_true", help="清空整库后重建（共享库请约定单独执行）")
+    ap.add_argument("--describes-only", action="store_true",
+                    help="仅重建 Chunk->DESCRIBES（不导入、不清库）")
     args = ap.parse_args()
     out = Path(args.out)
 
@@ -82,9 +125,17 @@ def main():
     )
     db = os.getenv("NEO4J_DB", "neo4j")
 
-    id_label = {}
     try:
         with driver.session(database=db) as session:
+            if args.describes_only:
+                push_describes(
+                    session,
+                    load_chunk_rows(chunk_path),
+                    load_entity_ids(entity_dir),
+                )
+                print("DESCRIBES 重建完成")
+                return
+
             if args.clean:
                 n = session.run("MATCH (n) DETACH DELETE n RETURN count(*) AS c").single()["c"]
                 print("已清空旧图，删除节点数 =", n)
@@ -93,11 +144,10 @@ def main():
                 if n:
                     raise SystemExit("当前库非空；正式重建请显式运行：python scripts/load_engine_out.py --clean")
 
+            id_label = load_entity_ids(entity_dir)
             for path in node_files:
                 label = path.stem.replace("entity_", "")
-                rows = list(iter_jsonl(path))
-                for row in rows:
-                    id_label[row["id"]] = label
+                rows = load_unique_rows(path)
                 payload = [{"id": r["id"], "props": flatten_props(r, exclude={"id"})} for r in rows]
                 run_in_batches(
                     session,
@@ -105,7 +155,7 @@ def main():
                     payload,
                     BATCH_NODES,
                 )
-                print(f"节点 {label}: {len(rows)}")
+                print(f"节点 {label}（去重后）: {len(rows)}")
 
             for path in rel_files:
                 rtype = path.stem.replace("rel_", "")
@@ -116,7 +166,7 @@ def main():
                 (src_label, dst_label), = labels
                 key = ""
                 if rtype == "LEARNS":
-                    key = " {method: row.method}"
+                    key = " {method: row.props.method}"
                 elif rtype == "TYPE_MOD":
                     key = " {defender_type: row.props.defender_type}"
                 payload = [{
@@ -132,7 +182,7 @@ def main():
                 run_in_batches(session, stmt, payload, BATCH_RELS)
                 print(f"关系 {rtype}: {len(rows)}")
 
-            chunk_rows = list(iter_jsonl(chunk_path))
+            chunk_rows = load_chunk_rows(chunk_path)
             payload = [{
                 "chunk_id": c["id"], "kind": c.get("kind"),
                 "entity_type": c.get("entity_label"), "entity_id": c.get("entity_id"),
@@ -147,23 +197,8 @@ def main():
                 BATCH_CHUNKS,
             )
 
-            by_label = {}
-            for c in chunk_rows:
-                lbl = c.get("entity_label")
-                if lbl in id_label and c.get("entity_id") in id_label:
-                    by_label.setdefault(lbl, []).append(c)
-            for lbl, rows in by_label.items():
-                sub = [{"chunk_id": c["id"], "entity_id": c["entity_id"]} for c in rows]
-                run_in_batches(
-                    session,
-                    "UNWIND $rows AS row "
-                    f"MATCH (c:Chunk {{chunk_id: row.chunk_id}}), (t:`{lbl}` {{id: row.entity_id}}) "
-                    "MERGE (c)-[:DESCRIBES]->(t)",
-                    sub,
-                    BATCH_CHUNKS,
-                )
-                print(f"Chunk DESCRIBES -> {lbl}: {len(sub)}")
-            print("实体块装载:", len(chunk_rows))
+            push_describes(session, chunk_rows, id_label)
+            print("实体块装载(按 chunk_id 去重):", len(chunk_rows))
     finally:
         driver.close()
 

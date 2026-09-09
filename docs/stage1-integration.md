@@ -1,6 +1,6 @@
 # 阶段一最终版集成说明
 
-> 更新：2026-09-08
+> 更新：2026-09-09
 > 分支：`stage1-final`（以 `master` 为基座）
 > 目标：把 `master`、`member1`、`member1-1`、`feat/retrieval`、`feat/生成评测` 合为一份可在 9/10 汇报使用的代码基线。
 
@@ -13,6 +13,7 @@
 | `member1-1` | 可复现增强 Schema 建库、HTTP Query API 客户端、批量向量化 | `src/build_engine.py`、`common/neo_http.py`、`scripts/embed_vectors.py` |
 | `feat/retrieval` | 实体邻域图谱事实注入、RAG vs GraphRAG 双模式 | `src/rag.py` 检索部分、`scripts/compare_rag.py` |
 | `feat/生成评测` | 5 个代表问题的普通 RAG vs GraphRAG 实测报告 | `docs/evaluation.md` |
+| `feat/frontend` | 示例问题、loading、错误提示、子图节点配色/图例 | `src/templates/index.html` |
 
 ## 2. 最终口径（成员必须统一）
 
@@ -40,9 +41,11 @@ python src\app.py
 
 ## 4. 9/10 汇报前待办
 
-- [ ] 选择一个同学执行一次“从零重建”（当前组内 Aura 实例仍是旧 Schema 时需要）。
+- [x] 已合入 `feat/frontend` 前端增强。
 - [x] 本地 `.env` 修正：已把 `EMBED_DIM=1024HF_ENDPOINT=...` 拆成两行（`.env` 不入库）。
-- [ ] 重跑 `scripts/smoke_rag.py` / `smoke_multiqa.py` / `compare_rag.py`，更新 `docs/PROGRESS.md` 中的实测数字。
+- [x] 组内 Aura 已按增强 Schema 全量导入，并补齐 `Chunk -[:DESCRIBES]-> 实体`。
+- [x] 已重跑 `scripts/smoke_rag.py` / `smoke_multiqa.py`（14/14）/ `smoke_ask.py`。
+- [ ] 重跑 `scripts/compare_rag.py`，把最后一轮答案/5 题对比更新到 `docs/evaluation.md`。
 - [ ] 在阶段一汇报前由小组 review `stage1-final`，再把合入结果打到 `master` 并打新 tag（建议 `v0.6-stage1`）。
 - [ ] 每次里程碑后做阶段性 `git commit` + `git tag` + 推 Gitee；小组成员用分支开发，不要直接改 `master`。
 

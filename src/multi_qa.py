@@ -226,10 +226,12 @@ class MultiQA:
 
     def narrative_edges(self):
         if self._narr is None:
-            rel = "|".join(NARRATIVE_RELS)
             self._narr = self._run(
-                f"MATCH (a:Pokemon)-[r:{rel}]->(b:Pokemon) "
-                "RETURN a.name_zh AS a, b.name_zh AS b, type(r) AS t, r.evidence AS ev, r.confidence AS cf")
+                "MATCH (a:Pokemon)-[r]->(b:Pokemon) "
+                "WHERE type(r) IN $rels "
+                "RETURN a.name_zh AS a, b.name_zh AS b, type(r) AS t, "
+                "properties(r).evidence AS ev, properties(r).confidence AS cf",
+                rels=list(NARRATIVE_RELS))
         return self._narr
 
     # ---------- 路由 ----------
