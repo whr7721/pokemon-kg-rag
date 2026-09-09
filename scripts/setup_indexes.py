@@ -17,6 +17,7 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 STEPS = [
     "DROP INDEX chunk_embedding IF EXISTS",
+    "CREATE FULLTEXT INDEX chunk_name IF NOT EXISTS FOR (c:Chunk) ON EACH [c.name_zh] OPTIONS {indexConfig: {`fulltext.analyzer`: 'cjk'}}",
     "CREATE VECTOR INDEX embedding_Chunk IF NOT EXISTS FOR (c:Chunk) ON (c.embedding) OPTIONS {indexConfig: {`vector.dimensions`: 1024, `vector.similarity_function`: 'cosine'}}",
     "CREATE CONSTRAINT pokemon_id IF NOT EXISTS FOR (p:Pokemon) REQUIRE p.pokedex_id IS UNIQUE",
     "CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.chunk_id IS UNIQUE",
@@ -36,7 +37,7 @@ def main():
                 print("OK:", s[:70])
             names = [r["name"] for r in session.run(
                 "SHOW INDEXES YIELD name WHERE name IN $names RETURN name",
-                names=["embedding_Chunk", "pokemon_id", "chunk_id"],
+                names=["chunk_name", "embedding_Chunk", "pokemon_id", "chunk_id"],
             )]
         print("已确认索引/约束:", ", ".join(names))
     finally:

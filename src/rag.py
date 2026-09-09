@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -25,6 +26,7 @@ from embedder import make_embedder
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 VECTOR_INDEX = os.getenv("VECTOR_INDEX") or "embedding_Chunk"
+FULLTEXT_INDEX = os.getenv("FULLTEXT_INDEX") or "chunk_name"
 
 RETRIEVAL_QUERY = """
 MATCH (node)-[:DESCRIBES]->(e)
@@ -40,6 +42,37 @@ RETURN node.text AS text,
        elab AS entity_label,
        coalesce(ent.name_zh, ent.name, ent.form_name, toString(ent.num), '') AS entity_name,
        score AS score
+"""
+
+TYPES18 = ("一般", "格斗", "飞行", "毒", "地面", "岩石", "虫", "幽灵", "钢",
+           "火", "水", "草", "电", "超能力", "冰", "龙", "恶", "妖精")
+
+NAME_HIT_QUERY = """
+CALL db.index.fulltext.queryNodes('{index}', $query_text) YIELD node, score
+WITH node, score
+MATCH (node)-[:DESCRIBES]->(e)
+OPTIONAL MATCH (par:Pokemon)-[:HAS_FORM]->(e)
+WITH node, score,
+     CASE WHEN par IS NOT NULL THEN par ELSE e END AS ent,
+     CASE WHEN par IS NOT NULL THEN 'Pokemon' ELSE labels(e)[0] END AS elab
+RETURN node.text AS text,
+       coalesce(node.entity_type, node.kind, '') AS kind,
+       CASE WHEN elab = 'Pokemon' THEN ent.pokedex_id
+            WHEN elab IN ['Move', 'Ability'] THEN ent.id
+            ELSE coalesce(ent.pokedex_id, ent.id, '') END AS entity_id,
+       elab AS entity_label,
+       coalesce(ent.name_zh, ent.name, ent.form_name, toString(ent.num), '') AS entity_name,
+       score AS score
+ORDER BY score DESC
+LIMIT $limit
+"""
+
+MOVE_POWER_QUERY = """
+MATCH (m:Move)
+WHERE m.power IS NOT NULL
+RETURN m.id AS id, m.name_zh AS name, m.type AS type, m.category AS category,
+       m.power AS power, m.accuracy AS accuracy, m.pp AS pp
+LIMIT 400
 """
 
 SUBGRAPH_QUERIES = {
@@ -146,8 +179,18 @@ ENTITY_FACT_QUERIES = {
     "Ability": """
         MATCH (a:Ability {id: $eid})
         OPTIONAL MATCH (p:Pokemon)-[:HAS_FORM]->(:Form)-[:HAS_ABILITY]->(a)
-        RETURN a.name_zh AS name, a.description AS description, a.generation AS generation,
+        RETURN a.name_zh AS name, a.description AS description,
+               coalesce(a.effect, a.description, a.text, '') AS effect,
+               a.generation AS generation,
                [x IN collect(DISTINCT p.name_zh) WHERE x IS NOT NULL][..8] AS pokemon_list
+    """,
+    "Type": """
+        MATCH (t:Type {id: $eid})
+        OPTIONAL MATCH (t)-[h:HITS_TYPE]->(def:Type)
+        OPTIONAL MATCH (att:Type)-[d:HITS_TYPE]->(t)
+        RETURN t.name_zh AS name,
+               [x IN collect(DISTINCT {to: def.name_zh, mult: h.multiplier}) WHERE x.to IS NOT NULL] AS attacks,
+               [x IN collect(DISTINCT {from: att.name_zh, mult: d.multiplier}) WHERE x.from IS NOT NULL] AS defenses
     """,
 }
 
@@ -229,21 +272,90 @@ class PokemonGraphRAG:
             system_instructions="你只根据给定上下文回答宝可梦相关问题，不要编造事实。",
         )
 
+    @staticmethod
+    def _candidate_labels(question):
+        labels = set()
+        if any(k in question for k in ("招式", "技能")) and "威力" in question:
+            labels.add("Move")
+        elif "特性" in question and not any(t in question for t in TYPES18):
+            labels.add("Ability")
+        elif any(k in question for k in ("进化", "最终进化")):
+            labels.add("Pokemon")
+        elif any(t in question for t in TYPES18) and any(
+            k in question for k in ("克制", "攻击", "弱点", "弱于", "怕", "免疫")
+        ):
+            labels.add("Type")
+        return labels or None
+
+    def _name_hits(self, question, limit=10):
+        """全文索引按实体名召回，并把只与问题完全匹配的实体留下。"""
+        labels = self._candidate_labels(question)
+        try:
+            records, _, _ = self.driver.execute_query(
+                NAME_HIT_QUERY.format(index=FULLTEXT_INDEX),
+                {"query_text": question, "limit": max(limit, 20)},
+                database_=self.db,
+                routing_=RoutingControl.READ,
+            )
+        except Exception:
+            return []
+        out = []
+        for rec in records:
+            data = rec.data()
+            if labels and data.get("entity_label") not in labels:
+                continue
+            name = str(data.get("entity_name") or "")
+            if not name or name not in question:
+                continue
+            out.append(record_formatter(data))
+        return out
+
     def retrieve(self, question, top_k=5):
-        result = self.retriever.search(query_text=question, top_k=top_k)
-        items = dedupe_by_entity(result.items)
+        result = self.retriever.search(query_text=question, top_k=top_k * 4)
+        items = dedupe_by_entity(
+            self._name_hits(question, limit=top_k * 2) + list(result.items),
+            limit=top_k,
+        )
         return [
             {"text": item.content, "metadata": item.metadata}
             for item in items
         ]
 
-    def get_entity_facts(self, items, limit=3):
+    def _move_power_facts(self, question):
+        """招式+威力条件问题：直接从图里取候选招式作为结构化事实。"""
+        m = re.search(r"(?:大于|超过|不低于|>=|>)\s*(\d+)", question)
+        if not m or not any(k in question for k in ("招式", "技能")):
+            return []
+        threshold = float(m.group(1))
+        wanted_types = [t for t in TYPES18 if t in question]
+        records, _, _ = self.driver.execute_query(
+            MOVE_POWER_QUERY,
+            database_=self.db,
+            routing_=RoutingControl.READ,
+        )
+        hits = []
+        for rec in records:
+            r = rec.data()
+            if wanted_types and r.get("type") not in wanted_types:
+                continue
+            try:
+                power = float(str(r.get("power")).replace(",", "").replace("—", "").strip() or 0)
+            except (TypeError, ValueError):
+                continue
+            if power >= threshold:
+                hits.append({**r, "power": int(power) if power.is_integer() else power})
+        hits.sort(key=lambda x: float(x["power"]), reverse=True)
+        return [{"label": "MoveFilter", "data": {"moves": hits[:12]}}] if hits else []
+
+    def get_entity_facts(self, items, limit=3, labels=None):
         seen = set()
         entities = []
         for it in items:
             meta = it.get("metadata") or {}
             pair = (meta.get("entity_label"), meta.get("entity_id"))
             if pair[0] and pair[1] and pair not in seen:
+                if labels and pair[0] not in labels:
+                    continue
                 seen.add(pair)
                 entities.append(pair)
                 if len(entities) >= limit:
@@ -316,12 +428,54 @@ class PokemonGraphRAG:
         if label == "Move":
             return f"【招式】{rec.get('name')} 属性:{rec.get('type')} 分类:{rec.get('category')} 威力:{rec.get('power')} 命中:{rec.get('accuracy')} 说明:{rec.get('description')}"
         if label == "Ability":
-            return f"【特性】{rec.get('name')} 第{rec.get('generation')}世代 说明:{rec.get('description')}"
+            eff = rec.get("effect") or rec.get("description") or ""
+            return f"【特性】{rec.get('name')} 说明:{eff}"
+        if label == "Type":
+            lines = [f"【属性类型】{rec.get('name')}"]
+            atk, weak, res = {}, {}, {}
+            for row in rec.get("attacks") or []:
+                try:
+                    mult = float(row.get("mult"))
+                except (TypeError, ValueError):
+                    continue
+                if mult > 1:
+                    atk.setdefault(mult, []).append(row.get("to"))
+            for row in rec.get("defenses") or []:
+                try:
+                    mult = float(row.get("mult"))
+                except (TypeError, ValueError):
+                    continue
+                if mult > 1:
+                    weak.setdefault(mult, []).append(row.get("from"))
+                elif 0 < mult < 1:
+                    res.setdefault(mult, []).append(row.get("from"))
+            if atk:
+                lines.append("  * 进攻克制: " + "；".join(
+                    f"{m:g}倍[{', '.join(sorted(set(v)))}]"
+                    for m, v in sorted(atk.items(), reverse=True)))
+            if weak:
+                lines.append("  * 防守弱点: " + "；".join(
+                    f"{m:g}倍[{', '.join(sorted(set(v)))}]"
+                    for m, v in sorted(weak.items(), reverse=True)))
+            if res:
+                lines.append("  * 抵抗/免疫: " + "；".join(
+                    f"{m:g}倍[{', '.join(sorted(set(v)))}]"
+                    for m, v in sorted(res.items())))
+            return "\n".join(lines)
+        if label == "MoveFilter":
+            moves = rec.get("moves") or []
+            return "【图谱筛选·招式】" + "；".join(
+                f"{x.get('name')}({x.get('type')}/{x.get('category')}/{x.get('power')}威力)"
+                for x in moves)
         return ""
 
     def ask(self, question, top_k=5, use_graph=True):
         evidence = self.retrieve(question, top_k=top_k)
-        facts = self.get_entity_facts(evidence) if use_graph else []
+        fact_labels = self._candidate_labels(question)
+        facts = self.get_entity_facts(evidence, labels=fact_labels) if use_graph else []
+        schema_facts = self._move_power_facts(question) if use_graph else []
+        if schema_facts:
+            facts = schema_facts + [f for f in facts if f["label"] != "Move"]
 
         context_parts = []
         if facts:
