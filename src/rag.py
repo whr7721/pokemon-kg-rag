@@ -1,78 +1,237 @@
-﻿import os
+# -*- coding: utf-8 -*-
+"""GraphRAG 检索与生成（阶段一最终合并版）。
+
+链路：问题 -> 本地/API BGE-M3 -> Neo4j 向量召回 Chunk -> 经 DESCRIBES 回到实体
+      -> 提取前若干实体的图谱邻域事实 -> 与文本块共同拼入 Prompt -> 学校 Qwen 生成。
+
+适用 Schema（增强版，见 src/build_engine.py）：
+    Pokemon -[:HAS_FORM]-> Form -[:HAS_TYPE|HAS_ABILITY|IN_EGG_GROUP|LEARNS]-> ...
+    Type -[:HITS_TYPE]-> Type；Pokemon -[:EVOLVES_TO]-> Pokemon；叙事边可选。
+"""
+from __future__ import annotations
+
+import os
+import re
 from pathlib import Path
+
 from dotenv import load_dotenv
 from neo4j import GraphDatabase, RoutingControl
-from neo4j_graphrag.retrievers import VectorCypherRetriever
+from neo4j_graphrag.generation import RagTemplate
 from neo4j_graphrag.llm import OpenAILLM
-from neo4j_graphrag.generation import GraphRAG, RagTemplate
+from neo4j_graphrag.retrievers import VectorCypherRetriever
 from neo4j_graphrag.types import RetrieverResultItem
-from embedder import BgeM3Embedder
+
+from embedder import make_embedder
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
+VECTOR_INDEX = os.getenv("VECTOR_INDEX") or "embedding_Chunk"
+FULLTEXT_INDEX = os.getenv("FULLTEXT_INDEX") or "chunk_name"
+
 RETRIEVAL_QUERY = """
 MATCH (node)-[:DESCRIBES]->(e)
+OPTIONAL MATCH (par:Pokemon)-[:HAS_FORM]->(e)
+WITH node, score,
+     CASE WHEN par IS NOT NULL THEN par ELSE e END AS ent,
+     CASE WHEN par IS NOT NULL THEN 'Pokemon' ELSE labels(e)[0] END AS elab
 RETURN node.text AS text,
-       node.kind AS kind,
-       node.entity_id AS entity_id,
-       labels(e)[0] AS entity_label,
-       coalesce(e.name_zh, e.name, '') AS entity_name,
+       coalesce(node.entity_type, node.kind, '') AS kind,
+       CASE WHEN elab = 'Pokemon' THEN ent.pokedex_id
+            WHEN elab IN ['Move', 'Ability'] THEN ent.id
+            ELSE coalesce(ent.pokedex_id, ent.id, '') END AS entity_id,
+       elab AS entity_label,
+       coalesce(ent.name_zh, ent.name, ent.form_name, toString(ent.num), '') AS entity_name,
        score AS score
+"""
+
+TYPES18 = ("一般", "格斗", "飞行", "毒", "地面", "岩石", "虫", "幽灵", "钢",
+           "火", "水", "草", "电", "超能力", "冰", "龙", "恶", "妖精")
+
+NAME_HIT_QUERY = """
+CALL db.index.fulltext.queryNodes('{index}', $query_text) YIELD node, score
+WITH node, score
+MATCH (node)-[:DESCRIBES]->(e)
+OPTIONAL MATCH (par:Pokemon)-[:HAS_FORM]->(e)
+WITH node, score,
+     CASE WHEN par IS NOT NULL THEN par ELSE e END AS ent,
+     CASE WHEN par IS NOT NULL THEN 'Pokemon' ELSE labels(e)[0] END AS elab
+RETURN node.text AS text,
+       coalesce(node.entity_type, node.kind, '') AS kind,
+       CASE WHEN elab = 'Pokemon' THEN ent.pokedex_id
+            WHEN elab IN ['Move', 'Ability'] THEN ent.id
+            ELSE coalesce(ent.pokedex_id, ent.id, '') END AS entity_id,
+       elab AS entity_label,
+       coalesce(ent.name_zh, ent.name, ent.form_name, toString(ent.num), '') AS entity_name,
+       score AS score
+ORDER BY score DESC
+LIMIT $limit
+"""
+
+MOVE_POWER_QUERY = """
+MATCH (m:Move)
+WHERE m.power IS NOT NULL
+RETURN m.id AS id, m.name_zh AS name, m.type AS type, m.category AS category,
+       m.power AS power, m.accuracy AS accuracy, m.pp AS pp
+LIMIT 400
 """
 
 SUBGRAPH_QUERIES = {
     "Pokemon": """
         MATCH (n:Pokemon {pokedex_id: $eid})
-        OPTIONAL MATCH (n)-[r:HAS_TYPE|HAS_ABILITY|BELONGS_TO_EGG_GROUP|BELONGS_TO_GENERATION|EVOLVES_TO]->(m)
+        OPTIONAL MATCH (n)-[:HAS_FORM]->(:Form)-[r:HAS_TYPE|HAS_ABILITY|IN_EGG_GROUP]->(m)
         WITH n, r, m
         WHERE r IS NOT NULL
-        RETURN labels(n)[0] AS sl, coalesce(n.name_zh, n.name, '') AS sn,
+        RETURN labels(n)[0] AS sl, coalesce(n.name_zh, '') AS sn,
                type(r) AS rel,
                labels(m)[0] AS tl,
-               coalesce(m.name_zh, m.name, toString(m.num), '') AS tn
+               coalesce(m.name_zh, m.id, '') AS tn
         UNION
         MATCH (n:Pokemon {pokedex_id: $eid})
         OPTIONAL MATCH (m)-[r:EVOLVES_TO]->(n)
         WITH n, r, m
         WHERE r IS NOT NULL
-        RETURN labels(n)[0] AS sl, coalesce(n.name_zh, n.name, '') AS sn,
+        RETURN labels(n)[0] AS sl, coalesce(n.name_zh, '') AS sn,
                type(r) AS rel,
                labels(m)[0] AS tl,
-               coalesce(m.name_zh, m.name, toString(m.num), '') AS tn
-    """,
-    "Move": """
-        MATCH (n:Move {name_zh: $eid})
-        OPTIONAL MATCH (m)-[r:LEARNS_MOVE]->(n)
+               coalesce(m.name_zh, m.id, '') AS tn
+        UNION
+        MATCH (n:Pokemon {pokedex_id: $eid})
+        OPTIONAL MATCH (n)-[r:EVOLVES_TO]->(m)
         WITH n, r, m
         WHERE r IS NOT NULL
-        RETURN labels(m)[0] AS sl, coalesce(m.name_zh, m.name, '') AS sn,
+        RETURN labels(n)[0] AS sl, coalesce(n.name_zh, '') AS sn,
                type(r) AS rel,
-               labels(n)[0] AS tl, coalesce(n.name_zh, n.name, '') AS tn
+               labels(m)[0] AS tl,
+               coalesce(m.name_zh, m.id, '') AS tn
+        UNION
+        MATCH (n:Pokemon {pokedex_id: $eid})
+        OPTIONAL MATCH (n)-[r]->(m:Pokemon)
+        WITH n, r, m
+        WHERE r IS NOT NULL AND type(r) IN ['PREDATES_ON','RIVAL_OF','ALLIED_WITH','COMPETES_WITH','COMMENSAL_OF','MENTOR_OF','SYMBIOTIC_WITH']
+        RETURN labels(n)[0] AS sl, coalesce(n.name_zh, '') AS sn,
+               type(r) AS rel,
+               labels(m)[0] AS tl, coalesce(m.name_zh, '') AS tn
+    """,
+    "Move": """
+        MATCH (n:Move {id: $eid})
+        OPTIONAL MATCH (m:Pokemon)-[:HAS_FORM]->(:Form)-[r:LEARNS]->(n)
+        WITH n, r, m
+        WHERE r IS NOT NULL
+        RETURN labels(m)[0] AS sl, coalesce(m.name_zh, '') AS sn,
+               type(r) AS rel,
+               labels(n)[0] AS tl, coalesce(n.name_zh, '') AS tn
         LIMIT 15
     """,
     "Ability": """
-        MATCH (n:Ability {name_zh: $eid})
-        OPTIONAL MATCH (m)-[r:HAS_ABILITY]->(n)
+        MATCH (n:Ability {id: $eid})
+        OPTIONAL MATCH (m:Pokemon)-[:HAS_FORM]->(:Form)-[r:HAS_ABILITY]->(n)
         WITH n, r, m
         WHERE r IS NOT NULL
-        RETURN labels(m)[0] AS sl, coalesce(m.name_zh, m.name, '') AS sn,
+        RETURN labels(m)[0] AS sl, coalesce(m.name_zh, '') AS sn,
                type(r) AS rel,
-               labels(n)[0] AS tl, coalesce(n.name_zh, n.name, '') AS tn
+               labels(n)[0] AS tl, coalesce(n.name_zh, '') AS tn
         LIMIT 15
     """,
 }
 
+ENTITY_FACT_QUERIES = {
+    "Pokemon": """
+        MATCH (p:Pokemon {pokedex_id: $eid})
+        CALL (p) {
+            OPTIONAL MATCH (p)-[:HAS_FORM]->(:Form)-[:HAS_TYPE]->(t:Type)
+            OPTIONAL MATCH (t)-[h:HITS_TYPE]-(tgt:Type)
+            RETURN [x IN collect(DISTINCT t.name_zh) WHERE x IS NOT NULL] AS types,
+                   [x IN collect(DISTINCT {from: startNode(h).name_zh, to: endNode(h).name_zh, mult: h.multiplier})
+                    WHERE x.from IS NOT NULL AND x.to IS NOT NULL] AS type_chart
+        }
+        CALL (p) {
+            OPTIONAL MATCH (p)-[:HAS_FORM]->(:Form)-[ha:HAS_ABILITY]->(a:Ability)
+            RETURN [x IN collect(DISTINCT {name: a.name_zh, hidden: ha.hidden}) WHERE x.name IS NOT NULL] AS abilities
+        }
+        CALL (p) {
+            OPTIONAL MATCH (p)-[:HAS_FORM]->(:Form)-[:IN_EGG_GROUP]->(e:EggGroup)
+            RETURN [x IN collect(DISTINCT e.name_zh) WHERE x IS NOT NULL] AS egg_groups
+        }
+        CALL (p) {
+            OPTIONAL MATCH (prev:Pokemon)-[r_prev:EVOLVES_TO]->(p)
+            OPTIONAL MATCH (p)-[r_next:EVOLVES_TO]->(nxt:Pokemon)
+            OPTIONAL MATCH (p)-[:EVOLVES_TO]->(:Pokemon)-[r_final:EVOLVES_TO]->(final:Pokemon)
+            RETURN [x IN collect(DISTINCT {from: prev.name_zh, condition: r_prev.condition}) WHERE x.from IS NOT NULL] AS evolves_from,
+                   [x IN collect(DISTINCT {to: nxt.name_zh, condition: r_next.condition}) WHERE x.to IS NOT NULL] AS evolves_to,
+                   [x IN collect(DISTINCT {final: final.name_zh, condition: r_final.condition}) WHERE x.final IS NOT NULL] AS final_evolution
+        }
+        CALL (p) {
+            OPTIONAL MATCH (p)-[r_narr]->(other:Pokemon)
+            WHERE type(r_narr) IN ['PREDATES_ON','RIVAL_OF','ALLIED_WITH','COMPETES_WITH','COMMENSAL_OF','MENTOR_OF','SYMBIOTIC_WITH']
+            RETURN [x IN collect(DISTINCT {rel: type(r_narr), other: other.name_zh, evidence: properties(r_narr).evidence})
+                    WHERE x.other IS NOT NULL] AS narrative
+        }
+        RETURN p.name_zh AS name, p.pokedex_id AS id, p.category AS category,
+               types, type_chart, abilities, egg_groups, evolves_from, evolves_to, final_evolution, narrative
+    """,
+    "Move": """
+        MATCH (m:Move {id: $eid})
+        OPTIONAL MATCH (p:Pokemon)-[:HAS_FORM]->(:Form)-[:LEARNS]->(m)
+        RETURN m.name_zh AS name, m.type AS type, m.category AS category,
+               m.power AS power, m.accuracy AS accuracy, m.pp AS pp, m.description AS description,
+               [x IN collect(DISTINCT p.name_zh) WHERE x IS NOT NULL][..8] AS learned_by
+    """,
+    "Ability": """
+        MATCH (a:Ability {id: $eid})
+        OPTIONAL MATCH (p:Pokemon)-[:HAS_FORM]->(:Form)-[:HAS_ABILITY]->(a)
+        RETURN a.name_zh AS name, a.description AS description,
+               coalesce(a.effect, a.description, a.text, '') AS effect,
+               a.generation AS generation,
+               [x IN collect(DISTINCT p.name_zh) WHERE x IS NOT NULL][..8] AS pokemon_list
+    """,
+    "Type": """
+        MATCH (t:Type {id: $eid})
+        OPTIONAL MATCH (t)-[h:HITS_TYPE]->(def:Type)
+        OPTIONAL MATCH (att:Type)-[d:HITS_TYPE]->(t)
+        RETURN t.name_zh AS name,
+               [x IN collect(DISTINCT {to: def.name_zh, mult: h.multiplier}) WHERE x.to IS NOT NULL] AS attacks,
+               [x IN collect(DISTINCT {from: att.name_zh, mult: d.multiplier}) WHERE x.from IS NOT NULL] AS defenses
+    """,
+}
+
+NARRATIVE_CN = {
+    "RIVAL_OF": "宿敌", "PREDATES_ON": "捕食", "COMPETES_WITH": "竞争",
+    "ALLIED_WITH": "结盟", "COMMENSAL_OF": "共生", "MENTOR_OF": "师徒",
+    "SYMBIOTIC_WITH": "互利共生",
+}
+
+
 def record_formatter(record):
+    name = record.get("entity_name")
+    prefix = f"[{name}] " if name else ""
     return RetrieverResultItem(
-        content=record["text"],
+        content=prefix + record["text"],
         metadata={
             "kind": record.get("kind"),
             "entity_id": record.get("entity_id"),
             "entity_label": record.get("entity_label"),
-            "entity_name": record.get("entity_name"),
+            "entity_name": name,
             "score": record.get("score"),
         },
     )
+
+
+def dedupe_by_entity(items, limit=None):
+    """同一实体多个文本块只保留召回分最高的一条，保持召回顺序。"""
+    seen, out = set(), []
+    for item in items:
+        md = item.metadata
+        key = (md.get("entity_label"), md.get("entity_id"))
+        if not all(key):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+        if limit and len(out) >= limit:
+            break
+    return out
+
 
 def get_driver():
     return GraphDatabase.driver(
@@ -81,14 +240,15 @@ def get_driver():
         notifications_disabled_classifications=["DEPRECATION"],
     )
 
+
 class PokemonGraphRAG:
     def __init__(self):
         self.driver = get_driver()
         self.db = os.getenv("NEO4J_DB")
-        self.embedder = BgeM3Embedder()
+        self.embedder = make_embedder()
         self.retriever = VectorCypherRetriever(
             self.driver,
-            "chunk_embedding",
+            VECTOR_INDEX,
             RETRIEVAL_QUERY,
             self.embedder,
             result_formatter=record_formatter,
@@ -99,41 +259,242 @@ class PokemonGraphRAG:
             base_url=os.getenv("LLM_ENDPOINT"),
             api_key=os.getenv("LLM_TOKEN"),
         )
-        self.rag = GraphRAG(
-            retriever=self.retriever,
-            llm=self.llm,
-            prompt_template=RagTemplate(
-                template=(
-                    "你是一个宝可梦知识助手。请只依据下面的上下文回答问题；"
-                    "如果上下文不足以回答，请直接说“资料不足”。\n\n"
-                    "示例:\n{examples}\n\n"
-                    "上下文:\n{context}\n\n"
-                    "问题: {query_text}\n\n"
-                    "回答:"
-                ),
-                expected_inputs=["context", "query_text", "examples"],
-                system_instructions="你只根据给定上下文回答宝可梦相关问题，不要编造事实。",
+        self.prompt_template = RagTemplate(
+            template=(
+                "你是一个宝可梦知识助手。请优先参考上下文中的【图谱结构化事实】和【检索文本块】准确回答问题。\n"
+                "如果上下文完全不足以回答，请直接说“资料不足”。\n\n"
+                "示例:\n{examples}\n\n"
+                "上下文:\n{context}\n\n"
+                "问题: {query_text}\n\n"
+                "回答:"
             ),
+            expected_inputs=["context", "query_text", "examples"],
+            system_instructions="你只根据给定上下文回答宝可梦相关问题，不要编造事实。",
         )
+
+    @staticmethod
+    def _candidate_labels(question):
+        labels = set()
+        if any(k in question for k in ("招式", "技能")) and "威力" in question:
+            labels.add("Move")
+        elif "特性" in question and not any(t in question for t in TYPES18):
+            labels.add("Ability")
+        elif any(k in question for k in ("进化", "最终进化")):
+            labels.add("Pokemon")
+        elif any(t in question for t in TYPES18) and any(
+            k in question for k in ("克制", "攻击", "弱点", "弱于", "怕", "免疫")
+        ):
+            labels.add("Type")
+        return labels or None
+
+    def _name_hits(self, question, limit=10):
+        """全文索引按实体名召回，并把只与问题完全匹配的实体留下。"""
+        labels = self._candidate_labels(question)
+        try:
+            records, _, _ = self.driver.execute_query(
+                NAME_HIT_QUERY.format(index=FULLTEXT_INDEX),
+                {"query_text": question, "limit": max(limit, 20)},
+                database_=self.db,
+                routing_=RoutingControl.READ,
+            )
+        except Exception:
+            return []
+        out = []
+        for rec in records:
+            data = rec.data()
+            if labels and data.get("entity_label") not in labels:
+                continue
+            name = str(data.get("entity_name") or "")
+            if not name or name not in question:
+                continue
+            out.append(record_formatter(data))
+        return out
 
     def retrieve(self, question, top_k=5):
-        result = self.retriever.search(query_text=question, top_k=top_k)
+        result = self.retriever.search(query_text=question, top_k=top_k * 4)
+        items = dedupe_by_entity(
+            self._name_hits(question, limit=top_k * 2) + list(result.items),
+            limit=top_k,
+        )
         return [
             {"text": item.content, "metadata": item.metadata}
-            for item in result.items
+            for item in items
         ]
 
-    def ask(self, question, top_k=5):
-        result = self.rag.search(
-            query_text=question,
-            retriever_config={"top_k": top_k},
-            return_context=True,
+    def _move_power_facts(self, question):
+        """招式+威力条件问题：直接从图里取候选招式作为结构化事实。"""
+        m = re.search(r"(?:大于|超过|不低于|>=|>)\s*(\d+)", question)
+        if not m or not any(k in question for k in ("招式", "技能")):
+            return []
+        threshold = float(m.group(1))
+        wanted_types = [t for t in TYPES18 if t in question]
+        records, _, _ = self.driver.execute_query(
+            MOVE_POWER_QUERY,
+            database_=self.db,
+            routing_=RoutingControl.READ,
         )
-        evidence = (
-            [{"text": item.content, "metadata": item.metadata} for item in result.retriever_result.items]
-            if result.retriever_result else []
+        hits = []
+        for rec in records:
+            r = rec.data()
+            if wanted_types and r.get("type") not in wanted_types:
+                continue
+            try:
+                power = float(str(r.get("power")).replace(",", "").replace("—", "").strip() or 0)
+            except (TypeError, ValueError):
+                continue
+            if power >= threshold:
+                hits.append({**r, "power": int(power) if power.is_integer() else power})
+        hits.sort(key=lambda x: float(x["power"]), reverse=True)
+        return [{"label": "MoveFilter", "data": {"moves": hits[:12]}}] if hits else []
+
+    def get_entity_facts(self, items, limit=3, labels=None):
+        seen = set()
+        entities = []
+        for it in items:
+            meta = it.get("metadata") or {}
+            pair = (meta.get("entity_label"), meta.get("entity_id"))
+            if pair[0] and pair[1] and pair not in seen:
+                if labels and pair[0] not in labels:
+                    continue
+                seen.add(pair)
+                entities.append(pair)
+                if len(entities) >= limit:
+                    break
+
+        facts = []
+        for label, eid in entities:
+            query = ENTITY_FACT_QUERIES.get(label)
+            if not query:
+                continue
+            records, _, _ = self.driver.execute_query(
+                query, {"eid": eid}, database_=self.db, routing_=RoutingControl.READ
+            )
+            if records:
+                facts.append({"label": label, "data": records[0].data()})
+        return facts
+
+    def format_fact(self, fact):
+        rec, label = fact.get("data") or {}, fact.get("label")
+        if not rec:
+            return ""
+        if label == "Pokemon":
+            types_str = " / ".join(rec.get("types") or [])
+            lines = [f"【宝可梦】{rec.get('name')}(编号:{rec.get('id')}) 属性:{types_str} 分类:{rec.get('category','')}"]
+            if rec.get("abilities"):
+                lines.append("  * 特性: " + "、".join(
+                    f"{a['name']}(隐藏)" if str(a.get("hidden")) == "True" else a['name']
+                    for a in rec["abilities"]))
+            if rec.get("egg_groups"):
+                lines.append("  * 蛋群: " + "、".join(rec["egg_groups"]))
+            if rec.get("evolves_from"):
+                lines.append("  * 前置进化: " + "；".join(
+                    f"{x['from']}({x.get('condition') or '常规'})" for x in rec["evolves_from"]))
+            if rec.get("evolves_to"):
+                lines.append("  * 后续进化: " + "；".join(
+                    f"{x['to']}({x.get('condition') or '常规'})" for x in rec["evolves_to"]))
+            if rec.get("final_evolution"):
+                lines.append("  * 最终进化: " + "；".join(
+                    f"{x['final']}({x.get('condition') or '常规'})" for x in rec["final_evolution"]))
+            types = rec.get("types") or []
+            chart = rec.get("type_chart") or []
+            for t in types:
+                atk = {}
+                dfs = {}
+                for row in chart:
+                    try:
+                        mult = float(row.get("mult"))
+                    except (TypeError, ValueError):
+                        continue
+                    if mult == 1:
+                        continue
+                    if row.get("from") == t:
+                        atk.setdefault(mult, []).append(row.get("to"))
+                    if row.get("to") == t:
+                        dfs.setdefault(mult, []).append(row.get("from"))
+                if atk:
+                    lines.append("  * %s进攻: " % t + "、".join(
+                        "%sx[%s]" % (m, "、".join(sorted(set(v))))
+                        for m, v in sorted(atk.items(), reverse=True)))
+                if dfs:
+                    lines.append("  * %s防守: " % t + "、".join(
+                        "%sx[%s]" % (m, "、".join(sorted(set(v))))
+                        for m, v in sorted(dfs.items(), reverse=True)))
+            if rec.get("narrative"):
+                for n in rec["narrative"]:
+                    ev = ("(证据: %s)" % n["evidence"]) if n.get("evidence") else ""
+                    lines.append("  * 生态关系: %s【%s】%s" % (
+                        NARRATIVE_CN.get(n.get("rel"), n.get("rel")), n.get("other"), ev))
+            return "\n".join(lines)
+        if label == "Move":
+            return f"【招式】{rec.get('name')} 属性:{rec.get('type')} 分类:{rec.get('category')} 威力:{rec.get('power')} 命中:{rec.get('accuracy')} 说明:{rec.get('description')}"
+        if label == "Ability":
+            eff = rec.get("effect") or rec.get("description") or ""
+            return f"【特性】{rec.get('name')} 说明:{eff}"
+        if label == "Type":
+            lines = [f"【属性类型】{rec.get('name')}"]
+            atk, weak, res = {}, {}, {}
+            for row in rec.get("attacks") or []:
+                try:
+                    mult = float(row.get("mult"))
+                except (TypeError, ValueError):
+                    continue
+                if mult > 1:
+                    atk.setdefault(mult, []).append(row.get("to"))
+            for row in rec.get("defenses") or []:
+                try:
+                    mult = float(row.get("mult"))
+                except (TypeError, ValueError):
+                    continue
+                if mult > 1:
+                    weak.setdefault(mult, []).append(row.get("from"))
+                elif 0 < mult < 1:
+                    res.setdefault(mult, []).append(row.get("from"))
+            if atk:
+                lines.append("  * 进攻克制: " + "；".join(
+                    f"{m:g}倍[{', '.join(sorted(set(v)))}]"
+                    for m, v in sorted(atk.items(), reverse=True)))
+            if weak:
+                lines.append("  * 防守弱点: " + "；".join(
+                    f"{m:g}倍[{', '.join(sorted(set(v)))}]"
+                    for m, v in sorted(weak.items(), reverse=True)))
+            if res:
+                lines.append("  * 抵抗/免疫: " + "；".join(
+                    f"{m:g}倍[{', '.join(sorted(set(v)))}]"
+                    for m, v in sorted(res.items())))
+            return "\n".join(lines)
+        if label == "MoveFilter":
+            moves = rec.get("moves") or []
+            return "【图谱筛选·招式】" + "；".join(
+                f"{x.get('name')}({x.get('type')}/{x.get('category')}/{x.get('power')}威力)"
+                for x in moves)
+        return ""
+
+    def ask(self, question, top_k=5, use_graph=True):
+        evidence = self.retrieve(question, top_k=top_k)
+        fact_labels = self._candidate_labels(question)
+        facts = self.get_entity_facts(evidence, labels=fact_labels) if use_graph else []
+        schema_facts = self._move_power_facts(question) if use_graph else []
+        if schema_facts:
+            facts = schema_facts + [f for f in facts if f["label"] != "Move"]
+
+        context_parts = []
+        if facts:
+            fact_texts = [self.format_fact(f) for f in facts]
+            context_parts.append("【图谱结构化事实】\n" + "\n\n".join(x for x in fact_texts if x))
+        if evidence:
+            context_parts.append("【检索文本块】\n" + "\n\n".join(e["text"] for e in evidence))
+
+        context = "\n\n".join(context_parts)
+        prompt = self.prompt_template.format(
+            query_text=question, context=context, examples=""
         )
-        return {"answer": result.answer, "evidence": evidence}
+        resp = self.llm.invoke(prompt)
+        return {
+            "answer": resp.content,
+            "evidence": evidence,
+            "facts": facts,
+            "mode": "graph_rag" if use_graph else "naive_rag",
+        }
 
     def subgraph(self, items, limit=3):
         nodes = {}
