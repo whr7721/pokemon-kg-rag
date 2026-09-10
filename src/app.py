@@ -14,7 +14,7 @@ from flask import Flask, jsonify, render_template, request
 from flask_cors import CORS
 
 from multi_qa import MultiQA
-from rag import PokemonGraphRAG
+from rag import PokemonGraphRAG, as_bool
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -47,11 +47,7 @@ def ask():
     if not question:
         return jsonify({"error": "question is required"}), 400
     top_k = int(data.get("top_k", 8))
-    raw_use_graph = data.get("use_graph", True)
-    if isinstance(raw_use_graph, str):
-        use_graph = raw_use_graph.lower() in ("1", "true", "yes", "on")
-    else:
-        use_graph = bool(raw_use_graph)
+    use_graph = as_bool(data.get("use_graph", True))
 
     structured = mqa.answer(question)
     if structured is not None:

@@ -230,7 +230,7 @@ NARRATIVE_CN = {
 }
 
 
-def _as_bool(value):
+def as_bool(value):
     """库内布尔字段以字符串形式存储（'True'/'False'），统一解析。"""
     if isinstance(value, bool):
         return value
@@ -309,7 +309,7 @@ class PokemonGraphRAG:
             expected_inputs=["context", "query_text", "examples"],
             system_instructions="你只根据给定上下文回答宝可梦相关问题，不要编造事实。",
         )
-        for warn in self.check_indexes():
+        for warn in self.health()["warnings"]:
             logger.warning(warn)
 
     @staticmethod
@@ -361,6 +361,8 @@ class PokemonGraphRAG:
         return out
 
     def retrieve(self, question, top_k=8):
+        # 两路各自多取候选（向量 ×4、实体名 ×2），合并去重后再截断到 top_k，
+        # 避免去重后不同实体不足。
         result = self.retriever.search(query_text=question, top_k=top_k * 4)
         items = dedupe_by_entity(
             self._name_hits(question, limit=top_k * 2) + list(result.items),
@@ -421,7 +423,7 @@ class PokemonGraphRAG:
             lines = [f"【宝可梦】{rec.get('name')}(编号:{rec.get('id')}) 属性:{types_str} 分类:{rec.get('category','')}"]
             if rec.get("abilities"):
                 lines.append("  * 特性: " + "、".join(
-                    f"{a['name']}(隐藏)" if _as_bool(a.get("hidden")) else a['name']
+                    f"{a['name']}(隐藏)" if as_bool(a.get("hidden")) else a['name']
                     for a in rec["abilities"]))
             if rec.get("egg_groups"):
                 lines.append("  * 蛋群: " + "、".join(rec["egg_groups"]))
@@ -539,8 +541,8 @@ class PokemonGraphRAG:
             "mode": "graph_rag" if use_graph else "naive_rag",
         }
 
-    def check_indexes(self):
-        """返回索引健康告警列表（空列表 = 全部 ONLINE）。"""
+    def health(self):
+        """索引自检快照：启动时打日志，/api/health 对外返回。"""
         names = [VECTOR_INDEX] + self.fulltext_indexes
         try:
             records, _, _ = self.driver.execute_query(
@@ -549,16 +551,11 @@ class PokemonGraphRAG:
                 database_=self.db,
                 routing_=RoutingControl.READ,
             )
+            states = {r["name"]: r["state"] for r in records}
+            warns = [f"索引缺失：{n}" for n in names if n not in states]
+            warns += [f"索引未就绪：{n}（{s}）" for n, s in states.items() if s != "ONLINE"]
         except Exception as exc:
-            return [f"索引状态查询失败：{exc}"]
-        states = {r["name"]: r["state"] for r in records}
-        warns = [f"索引缺失：{n}" for n in names if n not in states]
-        warns += [f"索引未就绪：{n}（{s}）" for n, s in states.items() if s != "ONLINE"]
-        return warns
-
-    def health(self):
-        """供 /api/health 使用的环境自检快照。"""
-        warns = self.check_indexes()
+            warns = [f"索引状态查询失败：{exc}"]
         return {
             "ok": not warns,
             "vector_index": VECTOR_INDEX,

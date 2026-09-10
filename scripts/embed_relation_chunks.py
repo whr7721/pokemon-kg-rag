@@ -110,24 +110,16 @@ def write_rows(driver, db, rows, model, batch=100):
             """,
             {"rows": part, "model": model}, database_=db,
         )
-        driver.execute_query(
-            """
-            UNWIND $rows AS row
-            MATCH (c:Chunk {chunk_id: row.chunk_id})
-            MATCH (e:Pokemon {pokedex_id: row.eid})
-            MERGE (c)-[:DESCRIBES]->(e)
-            """,
-            {"rows": [r for r in part if r["label"] == "Pokemon"]}, database_=db,
-        )
-        driver.execute_query(
-            """
-            UNWIND $rows AS row
-            MATCH (c:Chunk {chunk_id: row.chunk_id})
-            MATCH (e:Type {id: row.eid})
-            MERGE (c)-[:DESCRIBES]->(e)
-            """,
-            {"rows": [r for r in part if r["label"] == "Type"]}, database_=db,
-        )
+        # 关系块挂到主语实体上：进化边主语是 Pokemon，克制边主语是 Type
+        for label, key in (("Pokemon", "pokedex_id"), ("Type", "id")):
+            sub = [r for r in part if r["label"] == label]
+            if sub:
+                driver.execute_query(
+                    f"UNWIND $rows AS row "
+                    f"MATCH (c:Chunk {{chunk_id: row.chunk_id}}), (e:`{label}` {{{key}: row.eid}}) "
+                    "MERGE (c)-[:DESCRIBES]->(e)",
+                    {"rows": sub}, database_=db,
+                )
         written += len(part)
         print(f"  写入 {written}/{len(rows)}")
     return written
