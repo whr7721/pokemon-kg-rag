@@ -41,7 +41,7 @@ def main():
         answer = res["answer"] if res else "[open 回落]"
         ok = res is not None and res["kind"] == kind and all(e in answer for e in expects)
         passed += ok
-        print(("✅" if ok else "❌"), f"[{kind}] {q}")
+        print("PASS" if ok else "FAIL", f"[{kind}] {q}")
         print("   →", answer.replace("\n", "\n    "))
         if not ok:
             print("   !!! 期望包含:", expects, "| 实际 kind:", res["kind"] if res else None)
