@@ -26,7 +26,8 @@ mqa = MultiQA()
 
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok"})
+    snapshot = rag.health()
+    return jsonify({"status": "ok" if snapshot["ok"] else "degraded", **snapshot})
 
 
 @app.get("/")
