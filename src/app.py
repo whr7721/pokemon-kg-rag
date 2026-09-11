@@ -13,20 +13,19 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
 from flask_cors import CORS
 
-from multi_qa import MultiQA
-from rag import PokemonGraphRAG, as_bool
+from rag import as_bool
+from router import RagRouter
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 app = Flask(__name__)
 CORS(app)
-rag = PokemonGraphRAG()
-mqa = MultiQA()
+router = RagRouter()
 
 
 @app.get("/api/health")
 def health():
-    snapshot = rag.health()
+    snapshot = router.health()
     return jsonify({"status": "ok" if snapshot["ok"] else "degraded", **snapshot})
 
 
@@ -49,28 +48,7 @@ def ask():
     top_k = int(data.get("top_k", 8))
     use_graph = as_bool(data.get("use_graph", True))
 
-    structured = mqa.answer(question)
-    if structured is not None:
-        evidence = rag.retrieve(question, top_k=top_k)
-        return jsonify({
-            "question": question,
-            "answer": structured["answer"],
-            "mode": structured["kind"],
-            "facts": [],
-            "evidence": evidence,
-            "subgraph": rag.subgraph(evidence, limit=3),
-        })
-
-    result = rag.ask(question, top_k=top_k, use_graph=use_graph)
-    subgraph = rag.subgraph(result["evidence"], limit=3)
-    return jsonify({
-        "question": question,
-        "answer": result["answer"],
-        "mode": result.get("mode", "graph_rag"),
-        "facts": result.get("facts", []),
-        "evidence": result["evidence"],
-        "subgraph": subgraph,
-    })
+    return jsonify(router.answer(question, top_k=top_k, use_graph=use_graph))
 
 
 if __name__ == "__main__":

@@ -12,15 +12,8 @@
 """
 from __future__ import annotations
 
-import os
+from graph_access import GraphAccess
 
-from dotenv import load_dotenv
-from neo4j import GraphDatabase
-
-load_dotenv()
-
-NARRATIVE_RELS = ("RIVAL_OF", "PREDATES_ON", "COMPETES_WITH", "ALLIED_WITH",
-                  "COMMENSAL_OF", "MENTOR_OF", "SYMBIOTIC_WITH")
 NARRATIVE_CN = {
     "RIVAL_OF": "宿敌/敌对", "PREDATES_ON": "捕食", "COMPETES_WITH": "竞争",
     "ALLIED_WITH": "结盟/并肩", "COMMENSAL_OF": "共生/寄居", "MENTOR_OF": "师徒/教导",
@@ -64,13 +57,6 @@ def alias_normalize(question: str) -> str:
     return q
 
 
-def get_driver():
-    return GraphDatabase.driver(
-        os.getenv("NEO4J_URL"),
-        auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD")),
-    )
-
-
 def classify(question: str) -> str:
     if any(w in question for w in EVO_WORDS):
         return "evolution"
@@ -82,27 +68,19 @@ def classify(question: str) -> str:
 
 
 class MultiQA:
-    def __init__(self):
-        self.driver = get_driver()
-        self.db = os.getenv("NEO4J_DB") or "neo4j"
-        self._names = None
-        self._abilities = None
-        self._chart = None
-        self._pkm_types = None
-        self._evo = None
-        self._narr = None
+    def __init__(self, graph=None):
+        self.graph = graph or GraphAccess()
+        self.driver = self.graph.driver
+        self.db = self.graph.db
 
     def close(self):
-        self.driver.close()
+        self.graph.close()
 
     def _run(self, query, **params):
-        with self.driver.session(database=self.db) as s:
-            return s.run(query, **params).data()
+        return self.graph.run(query, **params)
 
     def names(self):
-        if self._names is None:
-            self._names = sorted(r["n"] for r in self._run("MATCH (p:Pokemon) RETURN p.name_zh AS n"))
-        return self._names
+        return self.graph.names()
 
     def species_in(self, question: str):
         """按在问题中出现的先后顺序返回宝可梦名（长度优先匹配避免子串抢词）。"""
@@ -119,9 +97,7 @@ class MultiQA:
         return res
 
     def abilities(self):
-        if self._abilities is None:
-            self._abilities = [r["n"] for r in self._run("MATCH (a:Ability) RETURN a.name_zh AS n")]
-        return self._abilities
+        return self.graph.abilities()
 
     def ability_in(self, question: str):
         for name in sorted(self.abilities(), key=len, reverse=True):
@@ -183,60 +159,19 @@ class MultiQA:
         return ("single", group[0]) if len(group) == 1 else ("multi", group)
 
     def ability_meta(self, names):
-        rows = self._run("""
-            UNWIND $names AS n
-            MATCH (a:Ability {name_zh: n})
-            OPTIONAL MATCH (f:Form)-[:HAS_ABILITY]->(a)
-            RETURN n AS name, a.description AS dsc,
-                   count(DISTINCT f.pokedex_id) AS holders
-        """, names=names)
-        return {r["name"]: r for r in rows}
+        return self.graph.ability_meta(names)
 
     def type_chart(self):
-        """攻击属性名 -> {防御属性名: 倍率}（HITS_TYPE 攻击→防御）。"""
-        if self._chart is None:
-            nm = {r["id"]: r["nm"] for r in self._run("MATCH (t:Type) RETURN t.id AS id, t.name_zh AS nm")}
-            self._chart = {}
-            for r in self._run("MATCH (a)-[h:HITS_TYPE]->(b) RETURN a.id AS a, b.id AS b, h.multiplier AS m"):
-                atk, dfn = nm.get(r["a"]), nm.get(r["b"])
-                if atk and dfn:
-                    self._chart.setdefault(atk, {})[dfn] = float(r["m"])
-        return self._chart
+        return self.graph.type_chart()
 
     def pokemon_default_types(self):
-        if self._pkm_types is None:
-            rows = self._run("""
-                MATCH (p:Pokemon)-[:HAS_FORM]->(f:Form)
-                OPTIONAL MATCH (f)-[:HAS_TYPE]->(t:Type)
-                WITH p, f, collect(DISTINCT t.name_zh) AS types
-                WHERE f.is_default IS NULL OR f.is_default = true OR toString(f.is_default) IN ['True', 'true', '1']
-                RETURN p.name_zh AS name, types
-            """)
-            merged = {}
-            for r in rows:
-                merged.setdefault(r["name"], r["types"])
-            self._pkm_types = merged
-        return self._pkm_types
+        return self.graph.pokemon_default_types()
 
     def evo_graph(self):
-        if self._evo is None:
-            g = {"out": {}, "in": {}, "cond": {}}
-            for r in self._run("MATCH (a)-[r:EVOLVES_TO]->(b) RETURN a.name_zh AS a, b.name_zh AS b, r.condition AS c"):
-                g["out"].setdefault(r["a"], []).append(r["b"])
-                g["in"].setdefault(r["b"], []).append(r["a"])
-                g["cond"][(r["a"], r["b"])] = r["c"]
-            self._evo = g
-        return self._evo
+        return self.graph.evo_graph()
 
     def narrative_edges(self):
-        if self._narr is None:
-            self._narr = self._run(
-                "MATCH (a:Pokemon)-[r]->(b:Pokemon) "
-                "WHERE type(r) IN $rels "
-                "RETURN a.name_zh AS a, b.name_zh AS b, type(r) AS t, "
-                "properties(r).evidence AS ev, properties(r).confidence AS cf",
-                rels=list(NARRATIVE_RELS))
-        return self._narr
+        return self.graph.narrative_edges()
 
     # ---------- 路由 ----------
     def answer(self, question: str):
@@ -278,22 +213,7 @@ class MultiQA:
 
     # ---------- 特性策略（带推荐：按"能否免疫/吸收对方属性招式"打分） ----------
     def _ability_rows(self, name):
-        rows = self._run("""
-            MATCH (p:Pokemon {name_zh: $n})-[:HAS_FORM]->(f:Form)-[r:HAS_ABILITY]->(a:Ability)
-            RETURN a.name_zh AS ab, a.description AS dsc, a.effect AS eff,
-                   coalesce(f.is_default,'') AS def, coalesce(r.hidden,'False') AS hd
-        """, n=name)
-        best = {}
-        for r in rows:
-            is_def = r["def"] in ("True", "") or str(r["def"]).lower() == "true"
-            hidden = str(r["hd"]).lower() in ("true", "1", "yes")
-            cur = best.get(r["ab"])
-            if cur is None or (is_def and not cur.get("def")):
-                best[r["ab"]] = {"hidden": hidden, "def": is_def,
-                                 "dsc": r["dsc"] or "", "eff": r["eff"] or ""}
-            elif is_def:
-                best[r["ab"]]["hidden"] = best[r["ab"]]["hidden"] or hidden
-        return best
+        return self.graph.ability_rows(name)
 
     @staticmethod
     def _covers(text, types):
