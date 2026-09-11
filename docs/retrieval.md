@@ -1,88 +1,141 @@
-# 双通道检索与实体邻域图谱事实注入规范
+# 混合检索、图谱事实注入与三论文增强规范（阶段二）
 
 > 负责人：成员二（向量与检索）
-> 基准版本：第一阶段（9/10 汇报里程碑）
-> 对应代码：`src/embedder.py`、`src/rag.py`、`scripts/compare_rag.py`、`src/app.py`
+> 基准版本：阶段二完整版（2026-09-11）
+> 对应代码：`src/embedder.py`、`src/rag.py`、`src/graph_access.py`、`scripts/embed_relation_chunks.py`、`scripts/tune_retrieval.py`、`scripts/run_ablation.py`
 
-## 1. 背景与核心改进
+---
 
-早期最小闭环只把 `VectorCypherRetriever` 召回到的 `Chunk.text` 交给 LLM，图谱关系主要用于前端子图展示，没有真正进入生成上下文。
+## 1. 背景与阶段二演进
 
-当前实现的核心改进是两条召回通道：
+阶段一的最小 RAG 存在两个核心痛点：
+1. **图谱与文本割裂**：图关系最初仅用于前端子图展示，生成时只靠向量召回的文本块，导致多跳进化、属性克制计算等结构化推理严重依赖大模型自由发挥甚至幻觉；
+2. **检索通道单一且缺乏理论指导**：仅靠向量召回容易漏召关键特性/招式，且无法根据不同问题自适应调整图遍历策略。
 
-- 语义通道：BGE-M3 向量召回 Top-K 文本块；
-- 精确名通道：按问题里的宝可梦/招式/特性实体名做全文召回，并要求实体名原文出现在问题中。
+阶段二在统一图访问层（`GraphAccess`）之上，参考三篇图增强 RAG 论文的核心思想进行了全链路升级：
+- **PolyG（查询感知规划）**：引入 `_plan(question)`，预先判定意图（进化/克制/特性/招式/开放），自适应约束实体标签、裁剪事实注入段落，并激活针对性的图扩展与路径深度；
+- **PathRAG（证据路径推理）**：新增 `GraphAccess.paths()`，沿图谱提取多跳因果链（如进化链条件链条），渲染为清晰的 `【图谱证据路径】` 注入 Prompt，使模型无需自行拼凑零散事实；
+- **KG²RAG（图谱引导的召回扩展）**：在向量与全文召回之后，沿种子实体的图结构展开关联实体（如进化家族、克制方宝可梦）及其专属的受击倍率块（`hit-profile`），形成第三路图扩展召回；
+- **RRF 混合分数融合**：引入 Reciprocal Rank Fusion（RRF，默认 $k=60$），单路内实体去重、跨路名次倒数求和，彻底规避向量余弦与 BM25 全文分数的尺度不可比问题。
 
-全文索引按实体标签命名（`pokemonFulltext` / `abilityFulltext` / `moveFulltext` / `formFulltext`），
-逐个查询后按召回分合并；命中实体节点后反查该实体的文本块（截断 700 字）。
+---
 
-两路结果按实体去重合并后，沿 `Chunk -[:DESCRIBES]-> 实体` 回到图谱实体，再查询实体邻域事实，把属性、特性、蛋群、进化链、属性克制等结构化信息与文本块一起拼入 Prompt。`use_graph=false` 时只使用文本块，作为普通 RAG 对照。
+## 2. 向量化与语料体系
 
-## 2. 向量化
+统一采用云端 OpenAI 兼容接口（SiliconFlow `BAAI/bge-m3`，1024 维）进行嵌入：
 
-统一使用云端 OpenAI 兼容 embedding API（不依赖本地 torch / sentence-transformers）：
+- **实体块（entity_chunks）**：30,714 块，由 `load_engine_out.py` 装载，覆盖宝可梦图鉴、形态、招式、特性详情。
+- **关系块（relation_chunks）**：9,774 块，由 `scripts/embed_relation_chunks.py` 消费 `build_engine.py` 权威产物入库。其中 `LEARNS` 与 `IN_DEX` 采用主语概览聚合压缩（从 8.8 万条压缩至 2,342 条），其余 `HAS_TYPE`、`HAS_ABILITY`、`EVOLVES_TO`、`HITS_TYPE`、`TYPE_MOD` 逐边入库。
+- **受击倍率块（hit-profile）**：1,019 块，直接取自原始数据 `type_effectiveness` 基础表，精确给出 18 属性伤害倍率，免去模型在双属性克制上的心算开销。
+- **向量索引**：统一为 Neo4j 向量索引 `embedding_Chunk`（1024 维，余弦相似度）。
 
-- `EMBED_ENDPOINT`：向量服务端点（如 `https://api.siliconflow.cn/v1/embeddings`）
-- `EMBED_API_KEY`（兼容 `EMBED_KEY`）：访问密钥
-- `EMBED_MODEL`：`BAAI/bge-m3`，1024 维
+---
 
-`src/embedder.py` 只有一个 `ApiEmbedder` 类，批量返回时按 `index` 排序再取，避免服务端乱序导致向量与文本错位。库内向量（`embed_model='bge-m3'`）与查询向量同属 `BAAI/bge-m3` 空间，可直接混用。
-
-向量索引统一为 `embedding_Chunk`，在 `scripts/setup_indexes.py` 中创建，1024 维、余弦相似度。
-
-## 3. 检索链路
+## 3. 检索全链路架构
 
 ```text
 用户提问
-  -> BGE-M3 向量化 + 实体名全文匹配（按实体标签命名的全文索引）
-  -> 向量索引 embedding_Chunk 与全文索引双路召回，按召回分合并
-  -> 按实体去重，Chunk -[:DESCRIBES]-> 实体（Form 会经 HAS_FORM 归一为父 Pokemon）
-  -> 对 Pokemon/Move/Ability/Type 查询邻域图谱事实
-  -> 招式类条件问题额外执行 Move 图谱筛选（如“属性+威力”）
-  -> 结构化事实 + 文本块拼入 Prompt
-  -> tju-llm 生成回答
+  │
+  ├─ 1. PolyG 意图感知规划: _plan(question) -> labels / need / paths / expand
+  │
+  ├─ 2. 三路并发召回:
+  │     ├─ [通道A: 语义向量] VectorCypherRetriever -> top_k * 4
+  │     ├─ [通道B: 精确全文] pokemonFulltext 等 per-label 索引 -> top_k * 2
+  │     └─ [通道C: 图谱扩展] _graph_expand (种子实体的 hit-profile + 关联实体块) -> top_k * 2
+  │
+  ├─ 3. RRF 分数融合: rrf_fuse([A, B, C], k=60) -> 截断到 top_k
+  │
+  ├─ 4. PathRAG 证据路径提取: graph.paths(eid, depth) -> 【图谱证据路径】
+  │
+  ├─ 5. 邻域事实注入: get_entity_facts() + format_fact(fact, need) 按需裁剪
+  │
+  └─ 6. Prompt 组装 (证据路径 + 裁剪结构化事实 + 检索文本块) -> tju-llm 生成
 ```
 
-`src/rag.py` 的关键查询：
+### 关键查询与方法职责
 
-- `RETRIEVAL_QUERY`：向量召回 + `DESCRIBES` 回实体。
-- `NAME_HIT_QUERY_CHUNK` / `NAME_HIT_QUERY_ENTITY`：实体名全文召回，解决“特性/招式名不在文本正文中”导致向量漏召的问题（如“茂盛”的文本块内不含“茂盛”二字）。
-- `ENTITY_FACT_QUERIES`：Pokemon / Move / Ability / Type 四类实体的邻域事实。
-- `MOVE_POWER_QUERY`：招式“属性 + 威力”筛选问题的图内候选，避免文本块覆盖不全。
-- `SUBGRAPH_QUERIES`：前端子图数据，各分支统一输出真实方向 `fl/fn → tl/tn`。
+| 标识 | 位置 | 职责 |
+|---|---|---|
+| `RETRIEVAL_QUERY` | `src/rag.py` | 向量召回命中 Chunk 后，经 `DESCRIBES` 边回溯父实体（Form 归一为 Pokemon） |
+| `NAME_HIT_QUERY` | `src/rag.py` | 全文索引按实体名精确命中，直接反查其实体文本块 |
+| `DEFAULT_TYPES_QUERY` | `src/graph_access.py` | 取目标宝可梦默认形态属性，结合 18×18 克制全表精确计算实际受击倍率 |
+| `TYPE_CANDIDATES_QUERY` | `src/graph_access.py` | 查找拥有克制属性的候选宝可梦（用于 KG²RAG 扩展） |
+| `PATH_QUERY_TMPL` | `src/graph_access.py` | 提取 `[:EVOLVES_TO*1..N]` 变长路径及进阶条件 |
+| `CHUNKS_BY_ENTITY_QUERY` | `src/graph_access.py` | 优先抽取实体的 `hit-profile` 和 `relation` 文本块 |
 
-召回参数：`app.py`、`retrieve()`、`ask()` 的 `top_k` 默认值统一为 8；向量通道取 `top_k×4`、精确名通道取 `top_k×2`，合并去重后截断到 `top_k`。
+---
 
-索引健康自检：`GET /api/health` 返回向量索引与全文索引在线状态；索引缺失或查询报错时 `_name_hits()` 打印警告并降级为仅向量召回（不再静默失败）。
+## 4. 检索参数网格搜索实验（C1）
 
-## 4. 图谱事实注入内容
+运行 `scripts/tune_retrieval.py`，在 19 道评测题集上对 `top_k ∈ {4, 6, 8, 12}` 与 `RRF_K ∈ {10, 30, 60, 100}` 进行网格遍历（内存预取缓存加速）：
 
-- Pokemon：属性、特性（普通/隐藏）、蛋群、前后置进化与最终进化、属性克制倍率。
-- Move：属性、分类、威力、命中、PP、说明、可学宝可梦。
-- Ability：说明、世代、持有宝可梦。
-- Type：进攻克制倍率与防守弱点/抵抗列表（`HITS_TYPE`）。
-- MoveFilter：符合“威力/属性”条件的招式候选，作为图谱筛选事实注入。
+| top_k | RRF_K=10 | RRF_K=30 | RRF_K=60 | RRF_K=100 | 平均命中率 |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| **4** | 10/19 | 10/19 | 10/19 | 10/19 | 52.6% |
+| **6** | 11/19 | 11/19 | 11/19 | 11/19 | 57.9% |
+| **8** | 12/19 | 12/19 | 12/19 | 12/19 | 63.2% |
+| **12** | **14/19** | **14/19** | **14/19** | **14/19** | **73.7%** |
 
-叙事关系 `RIVAL_OF/PREDATES_ON/...` 当前保留查询，但 `build_engine.py` 未生成这些边；只有额外导入叙事增强数据后才生效。
+### 参数实验结论
+1. **RRF 平滑常数鲁棒性强**：在 $k \in [10, 100]$ 区间内系统表现高度平稳，无剧烈敏感性，推荐保持生产默认值 $k=60$；
+2. **上下文容量效应**：$top\_k$ 扩大能显著提升复杂多跳与跨属性题目的证据覆盖度，当 $top\_k=12$ 时达到 73.7% 最佳召回率。
 
-## 5. 普通 RAG vs GraphRAG 对照
+---
 
-- `use_graph=true`：GraphRAG，注入图谱事实。
-- `use_graph=false`：普通 RAG，只注入检索文本块。
+## 5. 检索层四路 Ablation 对照实验（C2）
 
-完整 5 题对比结果见 `docs/evaluation.md`。`scripts/compare_rag.py` 会按当前库重新输出两类模式的回答，最终汇报前应以组内共享库的实测结果更新评测表。
+运行 `scripts/run_ablation.py`（$top\_k=8$，严格判定：期望子串必须全包含在证据拼接文本中；无 LLM 自由心算加成）：
 
-## 6. 环境变量
+### 综合性能对照
 
-| 配置项 | 说明 | 默认/示例 |
-| --- | --- | --- |
-| `EMBED_MODEL` | 向量模型 | `BAAI/bge-m3` |
-| `EMBED_DIM` | 向量维度 | `1024` |
-| `EMBED_ENDPOINT` | 向量服务端点 | `https://api.siliconflow.cn/v1/embeddings` |
-| `EMBED_API_KEY` / `EMBED_KEY` | 向量服务密钥 | `sk-...` |
-| `VECTOR_INDEX` | Neo4j 向量索引名 | `embedding_Chunk` |
-| `FULLTEXT_INDEXES` | 实体名全文索引列表（逗号分隔） | `pokemonFulltext,...` |
-| `LLM_ENDPOINT` | 大模型端点 | `https://ai.tju.edu.cn/api/v3` |
-| `LLM_MODEL` | 大模型名 | `tju-llm` |
-| `LLM_TOKEN` | 大模型密钥 | `...` |
-| `NEO4J_URL` / `NEO4J_DB` | Neo4j Aura 连接 | `neo4j+s://...` |
+| 检索路径 | 算法构成 | 命中数 / 总数 | 召回命中率 | 较纯向量提升 |
+|---|---|:---:|:---:|:---:|
+| `vector` | 仅向量检索（纯文本+关系块） | 9 / 19 | 47.4% | 基线 |
+| `fulltext` | 仅实体名全文精准检索 | 1 / 19 | 5.3% | — |
+| `hybrid` | 向量 + 全文 RRF 融合 | 8 / 19 | 42.1% | -5.3% |
+| **`hybrid_graph`** | **向量 + 全文 + KG²RAG 图扩展 (最终方案)** | **13 / 19** | **68.4%** | **+21.0%** (命中数 +44%) |
+
+### 逐题详细评测矩阵
+
+| 题号 | 类型 | 评测问题 | vector | fulltext | hybrid | hybrid_graph | 备注 |
+|:---:|:---:|---|:---:|:---:|:---:|:---:|---|
+| q01 | evolution | 妙蛙种子最终进化成什么？ | ✓ | ✗ | ✓ | ✓ | 关系块支持 |
+| q02 | evolution | 耿鬼是怎么进化出来的？ | ✓ | ✗ | ✓ | ✓ | 关系块支持 |
+| q03 | evolution | 伊布可以进化成哪些宝可梦？条件分别是什么？ | ✗ | ✗ | ✗ | ✗ | 分支过多超出单块上限 |
+| **q04** | counter | **什么宝可梦克制阿柏怪？** | ✗ | ✗ | ✗ | **✓** | **图扩展单独命中地面/超能** |
+| **q05** | counter | **皮卡丘怕什么属性？** | ✗ | ✗ | ✗ | **✓** | **图扩展命中受击块(地面)** |
+| **q06** | counter | **什么宝可梦能克制妙蛙种子？** | ✗ | ✗ | ✗ | **✓** | **图扩展命中飞行/火** |
+| q07 | counter | 烈咬陆鲨被什么4倍克制？ | ✓ | ✗ | ✓ | ✓ | 受击块支持 |
+| q08 | ability | 拥有避雷针特性的宝可梦有哪些？ | ✓ | ✗ | ✓ | ✓ | 关系块支持 |
+| q09 | ability | 拥有茂盛特性的宝可梦有哪些？ | ✗ | ✗ | ✗ | ✗ | 全系普特需多块拼接 |
+| q10 | ability | 拥有悬浮特性的宝可梦有哪些？ | ✓ | ✗ | ✓ | ✓ | 别名与错字对齐 |
+| q11 | suggest | 拥有蓄水特性的宝可梦有哪些？ | ✗ | ✗ | ✗ | ✗ | 相似特性建议需语义层 |
+| **q12** | counter | **板匙蛇怕什么属性？** | ✗ | ✗ | ✗ | **✓** | **图扩展命中受击块** |
+| q13 | strategy | 皮卡丘应对电系宝可梦时，适合携带什么特性？ | ✗ | ✗ | ✗ | ✗ | 策略题依赖生成层 |
+| q14 | strategy | 电击魔兽应对电系宝可梦时，适合携带什么特性？ | ✓ | ✗ | ✓ | ✓ | 电气引擎特性块命中 |
+| q15 | 属性 | 妙蛙种子的属性是什么？ | ✓ | ✓ | ✓ | ✓ | 全路径命中 |
+| q16 | 进化 | 小火龙的最终进化是谁？ | ✓ | ✗ | ✓ | ✓ | 进化关系块命中 |
+| q17 | 招式 | 哪些火属性招式威力大于 80？ | ✗ | ✗ | ✗ | ✗ | 属于条件筛选，由图事实兜底 |
+| **q18** | 属性克制 | **草属性克制哪些属性？** | ✓ | ✗ | ✗ | **✓** | **图扩展补全地面/岩石** |
+| q19 | 特性 | 茂盛特性的效果是什么？ | ✗ | ✗ | ✗ | ✗ | 特性效果文本位于 Ability 实体 |
+
+### 核心实验发现
+1. **KG²RAG 产生质的飞跃**：在纯克制和弱点查找题（`q04`, `q05`, `q06`, `q12`）中，纯向量与纯全文检索在 4 万语料库中完全无法召回对应属性的克制候选或精准受击说明；**KG²RAG 沿图谱结构扩展后，4 道题全部从 0 翻盘至命中**；
+2. **解决语义稀释与单路多块垄断**：标准 RRF 实施单路最高位排他去重后，彻底解决了单个高频实体因分块过多在向量列表中重复累加霸榜的问题，使全文通道的高精度命中（如特性名实体）能够顺利跻身 Top-3；
+3. **分工互补验证**：成员一入库的 `hit-profile`（受击块）与成员二的 `_graph_expand` 形成了闭环联动，证明图数据建模与检索算法深度配合是图谱问答领先于纯向量 RAG 的关键。
+
+---
+
+## 6. 环境变量与运行配置
+
+| 配置项 | 默认值 | 作用与说明 |
+|---|---|---|
+| `EMBED_ENDPOINT` | `https://api.siliconflow.cn/v1/embeddings` | OpenAI 兼容的云端向量 API 端点 |
+| `EMBED_API_KEY` | `sk-...` | 向量模型授权密钥（兼容 `EMBED_KEY`） |
+| `EMBED_MODEL` | `BAAI/bge-m3` | 向量模型标识（1024 维） |
+| `VECTOR_INDEX` | `embedding_Chunk` | Neo4j 向量索引名称 |
+| `FULLTEXT_INDEXES` | `pokemonFulltext,abilityFulltext,moveFulltext,formFulltext` | 实体级 CJK 全文索引 |
+| `RRF_K` | `60` | RRF 倒数平滑常数（可通过环境变量调参） |
+| `LLM_ENDPOINT` | `https://ai.tju.edu.cn/api/v3` | 语言模型服务地址 |
+| `LLM_MODEL` | `tju-llm` | 生成模型标识 |
+| `LLM_TOKEN` | `...` | 语言模型授权 Token |

@@ -16,14 +16,13 @@ import re
 from pathlib import Path
 
 from dotenv import load_dotenv
-from neo4j import RoutingControl
 from neo4j_graphrag.generation import RagTemplate
 from neo4j_graphrag.llm import OpenAILLM
 from neo4j_graphrag.retrievers import VectorCypherRetriever
 from neo4j_graphrag.types import RetrieverResultItem
 
 from embedder import ApiEmbedder
-from graph_access import GraphAccess
+from graph_access import METHOD_CN, GraphAccess
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -177,38 +176,58 @@ def record_formatter(record):
     )
 
 
-def dedupe_by_entity(items, limit=None):
-    """同一实体多个文本块只保留召回分最高的一条，保持召回顺序。"""
-    seen, out = set(), []
-    for item in items:
-        md = item.metadata
-        key = (md.get("entity_label"), md.get("entity_id"))
-        if not all(key):
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(item)
-        if limit and len(out) >= limit:
-            break
-    return out
+RRF_K = 60   # Reciprocal Rank Fusion 平滑常数，越大越平缓
+
+# 查询感知的检索计划（PolyG）：labels 过滤实体类型，need 裁剪事实段落，
+# paths 控制证据路径跳数，expand 决定图引导召回的扩展规则。
+PLANS = {
+    "evolution": {"labels": {"Pokemon"}, "need": {"types", "abilities", "evolution"},
+                  "paths": 2, "expand": "evolution"},
+    "counter": {"labels": {"Type", "Pokemon"}, "need": {"types"},
+                "paths": 0, "expand": "counter"},
+    "ability": {"labels": {"Ability", "Pokemon"}, "need": {"abilities"},
+                "paths": 1, "expand": None},
+    "move": {"labels": {"Move"}, "need": {"move"}, "paths": 0, "expand": None},
+    "open": {"labels": None, "need": None, "paths": 1, "expand": None},
+}
+
+
+def rrf_fuse(rank_lists, k=RRF_K):
+    """Reciprocal Rank Fusion：按各路名次倒数求和后重排。
+
+    向量余弦与全文 BM25 的分数尺度不可比，直接加权求和需要额外归一化和调参；
+    RRF 只看名次，天然规避这个问题。缺实体键的条目直接丢弃（无法去重对齐）。
+    单路内同一实体只计最高名次一次，避免单个实体的多个低位分块因重复累加而挤掉真正相关的实体。
+    """
+    scores, items = {}, {}
+    for rank_list in rank_lists:
+        seen_in_list = set()
+        for rank, item in enumerate(rank_list):
+            key = (item.metadata.get("entity_label"), item.metadata.get("entity_id"))
+            if not all(key):
+                continue
+            if key in seen_in_list:
+                continue
+            seen_in_list.add(key)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+            items.setdefault(key, item)
+    return [items[key] for key in sorted(scores, key=lambda x: -scores[x])]
 
 
 class PokemonGraphRAG:
     def __init__(self, graph=None):
         self.graph = graph or GraphAccess()
-        self.driver = self.graph.driver
-        self.db = self.graph.db
         self.fulltext_indexes = FULLTEXT_INDEXES
         self._fulltext_warned = set()
+        self.rrf_k = int(os.getenv("RRF_K") or RRF_K)
         self.embedder = ApiEmbedder()
         self.retriever = VectorCypherRetriever(
-            self.driver,
+            self.graph.driver,
             VECTOR_INDEX,
             RETRIEVAL_QUERY,
             self.embedder,
             result_formatter=record_formatter,
-            neo4j_database=self.db,
+            neo4j_database=self.graph.db,
         )
         self.llm = OpenAILLM(
             model_name=os.getenv("LLM_MODEL", "tju-llm"),
@@ -231,34 +250,32 @@ class PokemonGraphRAG:
             logger.warning(warn)
 
     @staticmethod
-    def _candidate_labels(question):
-        labels = set()
+    def _plan(question):
+        """按问题意图返回检索计划（PolyG）。"""
         if any(k in question for k in ("招式", "技能")) and "威力" in question:
-            labels.add("Move")
-        elif "特性" in question and not any(t in question for t in TYPES18):
-            labels.add("Ability")
-        elif any(k in question for k in ("进化", "最终进化")):
-            labels.add("Pokemon")
-        elif any(t in question for t in TYPES18) and any(
-            k in question for k in ("克制", "攻击", "弱点", "弱于", "怕", "免疫")
+            return PLANS["move"]
+        if "特性" in question and not any(t in question for t in TYPES18):
+            return PLANS["ability"]
+        if any(k in question for k in ("进化", "最终进化")):
+            return PLANS["evolution"]
+        if any(k in question for k in ("克制", "弱点", "弱于", "怕", "天敌")) or (
+            any(t in question for t in TYPES18) and any(k in question for k in ("攻击", "免疫"))
         ):
-            labels.add("Type")
-        return labels or None
+            return PLANS["counter"]
+        return PLANS["open"]
 
-    def _name_hits(self, question, limit=10):
+    def _name_hits(self, question, labels=None, limit=10):
         """全文索引按实体名召回，并把只与问题完全匹配的实体留下。
 
-        索引缺失或查询报错时不静默失败：打印警告并降级为仅向量召回。
+        labels 来自检索计划；索引缺失或查询报错时不静默失败，打印警告并降级。
         """
-        labels = self._candidate_labels(question)
         out = []
         for index in self.fulltext_indexes:
             try:
-                records, _, _ = self.driver.execute_query(
+                rows = self.graph.run(
                     NAME_HIT_QUERY.format(index=index),
-                    {"query_text": question, "limit": max(limit, 20)},
-                    database_=self.db,
-                    routing_=RoutingControl.READ,
+                    query_text=question,
+                    limit=max(limit, 20),
                 )
             except Exception as exc:
                 if index not in self._fulltext_warned:
@@ -267,8 +284,7 @@ class PokemonGraphRAG:
                         "全文索引 '%s' 不可用，本次降级为仅向量召回：%s", index, exc
                     )
                 continue
-            for rec in records:
-                data = rec.data()
+            for data in rows:
                 if labels and data.get("entity_label") not in labels:
                     continue
                 name = str(data.get("entity_name") or "")
@@ -279,17 +295,51 @@ class PokemonGraphRAG:
         return out
 
     def retrieve(self, question, top_k=8):
-        # 两路各自多取候选（向量 ×4、实体名 ×2），合并去重后再截断到 top_k，
-        # 避免去重后不同实体不足。
-        result = self.retriever.search(query_text=question, top_k=top_k * 4)
-        items = dedupe_by_entity(
-            self._name_hits(question, limit=top_k * 2) + list(result.items),
-            limit=top_k,
-        )
-        return [
-            {"text": item.content, "metadata": item.metadata}
-            for item in items
-        ]
+        """三路召回 + RRF 融合：向量 / 实体名全文 / 图扩展（KG²RAG）。"""
+        plan = self._plan(question)
+        vector = list(self.retriever.search(query_text=question, top_k=top_k * 4).items)
+        by_name = self._name_hits(question, labels=plan["labels"], limit=top_k * 2)
+        expanded = self._graph_expand(vector + by_name, plan, limit=top_k * 2)
+        fused = rrf_fuse([vector, by_name, expanded], k=self.rrf_k)
+        return [{"text": it.content, "metadata": it.metadata} for it in fused[:top_k]]
+
+    def _graph_expand(self, items, plan, limit=8):
+        """KG²RAG：按计划的扩展规则找相关实体，再取它们的文本块。"""
+        rule = plan.get("expand")
+        if not rule:
+            return []
+        seeds = []
+        for item in items:
+            md = item.metadata
+            eid = md.get("entity_id")
+            if md.get("entity_label") == "Pokemon" and eid and eid not in seeds:
+                seeds.append(eid)
+            if len(seeds) >= 2:
+                break
+        if not seeds:
+            return []
+        ids = list(seeds)
+        for eid in seeds:
+            for rid in self.graph.related_ids(eid, rule, limit=limit):
+                if rid not in ids:
+                    ids.append(rid)
+        return [record_formatter(row) for row in self.graph.chunks_of(ids[:limit], limit=limit)]
+
+    def format_paths(self, rows):
+        """PathRAG：把进化路径渲染为带条件的箭头串。"""
+        lines = []
+        for row in rows or []:
+            names, rels = row.get("names") or [], row.get("rels") or []
+            if len(names) < 2:
+                continue
+            text = names[0]
+            for i, rel in enumerate(rels):
+                step = "、".join(x for x in (
+                    METHOD_CN.get(rel.get("method"), rel.get("method") or ""),
+                    rel.get("condition") or "") if x)
+                text += f"--[{step or '特殊'}]--> {names[i + 1]}"
+            lines.append("  * " + text)
+        return "【图谱证据路径】\n" + "\n".join(lines) if lines else ""
 
     def _move_power_facts(self, question):
         """招式+威力条件问题：直接从图里取候选招式作为结构化事实。"""
@@ -297,13 +347,11 @@ class PokemonGraphRAG:
         if not m or not any(k in question for k in ("招式", "技能")):
             return []
         wanted_types = [t for t in TYPES18 if t in question]
-        records, _, _ = self.driver.execute_query(
+        moves = self.graph.run(
             MOVE_POWER_QUERY,
-            {"threshold": int(m.group(1)), "move_types": wanted_types or None},
-            database_=self.db,
-            routing_=RoutingControl.READ,
+            threshold=int(m.group(1)),
+            move_types=wanted_types or None,
         )
-        moves = [rec.data() for rec in records]
         return [{"label": "MoveFilter", "data": {"moves": moves}}] if moves else []
 
     def get_entity_facts(self, items, limit=3, labels=None):
@@ -325,36 +373,35 @@ class PokemonGraphRAG:
             query = ENTITY_FACT_QUERIES.get(label)
             if not query:
                 continue
-            records, _, _ = self.driver.execute_query(
-                query, {"eid": eid}, database_=self.db, routing_=RoutingControl.READ
-            )
-            if records:
-                facts.append({"label": label, "data": records[0].data()})
+            rows = self.graph.run(query, eid=eid)
+            if rows:
+                facts.append({"label": label, "data": rows[0]})
         return facts
 
-    def format_fact(self, fact):
+    def format_fact(self, fact, need=None):
+        """渲染单条图谱事实。need 为 None 时输出全部段落，否则只输出命中的部分。"""
         rec, label = fact.get("data") or {}, fact.get("label")
         if not rec:
             return ""
         if label == "Pokemon":
             types_str = " / ".join(rec.get("types") or [])
             lines = [f"【宝可梦】{rec.get('name')}(编号:{rec.get('id')}) 属性:{types_str} 分类:{rec.get('category','')}"]
-            if rec.get("abilities"):
+            if (need is None or "abilities" in need) and rec.get("abilities"):
                 lines.append("  * 特性: " + "、".join(
                     f"{a['name']}(隐藏)" if as_bool(a.get("hidden")) else a['name']
                     for a in rec["abilities"]))
-            if rec.get("egg_groups"):
+            if need is None and rec.get("egg_groups"):
                 lines.append("  * 蛋群: " + "、".join(rec["egg_groups"]))
-            if rec.get("evolves_from"):
+            if (need is None or "evolution" in need) and rec.get("evolves_from"):
                 lines.append("  * 前置进化: " + "；".join(
                     f"{x['from']}({x.get('condition') or '常规'})" for x in rec["evolves_from"]))
-            if rec.get("evolves_to"):
+            if (need is None or "evolution" in need) and rec.get("evolves_to"):
                 lines.append("  * 后续进化: " + "；".join(
                     f"{x['to']}({x.get('condition') or '常规'})" for x in rec["evolves_to"]))
-            if rec.get("final_evolution"):
+            if (need is None or "evolution" in need) and rec.get("final_evolution"):
                 lines.append("  * 最终进化: " + "；".join(
                     f"{x['final']}({x.get('condition') or '常规'})" for x in rec["final_evolution"]))
-            types = rec.get("types") or []
+            types = rec.get("types") if (need is None or "types" in need) else []
             chart = rec.get("type_chart") or []
             for t in types:
                 atk = {}
@@ -378,7 +425,7 @@ class PokemonGraphRAG:
                     lines.append("  * %s防守: " % t + "、".join(
                         "%sx[%s]" % (m, "、".join(sorted(set(v))))
                         for m, v in sorted(dfs.items(), reverse=True)))
-            if rec.get("narrative"):
+            if need is None and rec.get("narrative"):
                 for n in rec["narrative"]:
                     ev = ("(证据: %s)" % n["evidence"]) if n.get("evidence") else ""
                     lines.append("  * 生态关系: %s【%s】%s" % (
@@ -429,8 +476,9 @@ class PokemonGraphRAG:
         return ""
 
     def ask(self, question, top_k=8, use_graph=True):
+        plan = self._plan(question)
         evidence = self.retrieve(question, top_k=top_k)
-        fact_labels = self._candidate_labels(question)
+        fact_labels = plan["labels"]
         facts = self.get_entity_facts(evidence, labels=fact_labels) if use_graph else []
         if use_graph and not facts and fact_labels:
             # 标签过滤过严时（如“某宝可梦有哪些特性”被判为 Ability，而召回到的是 Pokemon）
@@ -442,8 +490,16 @@ class PokemonGraphRAG:
 
         context_parts = []
         if facts:
-            fact_texts = [self.format_fact(f) for f in facts]
+            fact_texts = [self.format_fact(f, need=plan["need"]) for f in facts]
             context_parts.append("【图谱结构化事实】\n" + "\n\n".join(x for x in fact_texts if x))
+        if use_graph and plan["paths"]:
+            for f in facts:
+                if f["label"] == "Pokemon":
+                    path_text = self.format_paths(
+                        self.graph.paths(f["data"].get("id"), depth=plan["paths"]))
+                    if path_text:
+                        context_parts.append(path_text)
+                    break
         if evidence:
             context_parts.append("【检索文本块】\n" + "\n\n".join(e["text"] for e in evidence))
 
@@ -463,13 +519,11 @@ class PokemonGraphRAG:
         """索引自检快照：启动时打日志，/api/health 对外返回。"""
         names = [VECTOR_INDEX] + self.fulltext_indexes
         try:
-            records, _, _ = self.driver.execute_query(
+            rows = self.graph.run(
                 "SHOW INDEXES YIELD name, state WHERE name IN $names RETURN name, state",
-                {"names": names},
-                database_=self.db,
-                routing_=RoutingControl.READ,
+                names=names,
             )
-            states = {r["name"]: r["state"] for r in records}
+            states = {r["name"]: r["state"] for r in rows}
             warns = [f"索引缺失：{n}" for n in names if n not in states]
             warns += [f"索引未就绪：{n}（{s}）" for n, s in states.items() if s != "ONLINE"]
         except Exception as exc:

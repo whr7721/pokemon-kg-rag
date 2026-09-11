@@ -70,8 +70,6 @@ def classify(question: str) -> str:
 class MultiQA:
     def __init__(self, graph=None):
         self.graph = graph or GraphAccess()
-        self.driver = self.graph.driver
-        self.db = self.graph.db
 
     def close(self):
         self.graph.close()
