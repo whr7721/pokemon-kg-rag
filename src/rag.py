@@ -16,13 +16,14 @@ import re
 from pathlib import Path
 
 from dotenv import load_dotenv
-from neo4j import GraphDatabase, RoutingControl
+from neo4j import RoutingControl
 from neo4j_graphrag.generation import RagTemplate
 from neo4j_graphrag.llm import OpenAILLM
 from neo4j_graphrag.retrievers import VectorCypherRetriever
 from neo4j_graphrag.types import RetrieverResultItem
 
 from embedder import ApiEmbedder
+from graph_access import GraphAccess
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -86,82 +87,6 @@ RETURN m.name_zh AS name, m.type AS type, m.category AS category,
        toInteger(m.power) AS power
 ORDER BY power DESC
 """
-
-SUBGRAPH_QUERIES = {
-    "Pokemon": """
-        MATCH (n:Pokemon {pokedex_id: $eid})
-        OPTIONAL MATCH (n)-[:HAS_FORM]->(:Form)-[r:HAS_TYPE|HAS_ABILITY|IN_EGG_GROUP]->(m)
-        WITH n, r, m
-        WHERE r IS NOT NULL
-        RETURN labels(n)[0] AS fl, coalesce(n.name_zh, n.id, '') AS fn,
-               type(r) AS rel,
-               labels(m)[0] AS tl,
-               coalesce(m.name_zh, m.id, '') AS tn
-        UNION
-        MATCH (n:Pokemon {pokedex_id: $eid})
-        OPTIONAL MATCH (m)-[r:EVOLVES_TO]->(n)
-        WITH n, r, m
-        WHERE r IS NOT NULL
-        RETURN labels(m)[0] AS fl, coalesce(m.name_zh, m.id, '') AS fn,
-               type(r) AS rel,
-               labels(n)[0] AS tl,
-               coalesce(n.name_zh, n.id, '') AS tn
-        UNION
-        MATCH (n:Pokemon {pokedex_id: $eid})
-        OPTIONAL MATCH (n)-[r:EVOLVES_TO]->(m)
-        WITH n, r, m
-        WHERE r IS NOT NULL
-        RETURN labels(n)[0] AS fl, coalesce(n.name_zh, n.id, '') AS fn,
-               type(r) AS rel,
-               labels(m)[0] AS tl,
-               coalesce(m.name_zh, m.id, '') AS tn
-        UNION
-        MATCH (n:Pokemon {pokedex_id: $eid})
-        OPTIONAL MATCH (n)-[r]->(m:Pokemon)
-        WITH n, r, m
-        WHERE r IS NOT NULL AND type(r) IN ['PREDATES_ON','RIVAL_OF','ALLIED_WITH','COMPETES_WITH','COMMENSAL_OF','MENTOR_OF','SYMBIOTIC_WITH']
-        RETURN labels(n)[0] AS fl, coalesce(n.name_zh, n.id, '') AS fn,
-               type(r) AS rel,
-               labels(m)[0] AS tl, coalesce(m.name_zh, '') AS tn
-    """,
-    "Move": """
-        MATCH (n:Move {id: $eid})
-        OPTIONAL MATCH (m:Pokemon)-[:HAS_FORM]->(:Form)-[r:LEARNS]->(n)
-        WITH n, r, m
-        WHERE r IS NOT NULL
-        RETURN labels(m)[0] AS fl, coalesce(m.name_zh, m.id, '') AS fn,
-               type(r) AS rel,
-               labels(n)[0] AS tl, coalesce(n.name_zh, '') AS tn
-        LIMIT 15
-    """,
-    "Ability": """
-        MATCH (n:Ability {id: $eid})
-        OPTIONAL MATCH (m:Pokemon)-[:HAS_FORM]->(:Form)-[r:HAS_ABILITY]->(n)
-        WITH n, r, m
-        WHERE r IS NOT NULL
-        RETURN labels(m)[0] AS fl, coalesce(m.name_zh, m.id, '') AS fn,
-               type(r) AS rel,
-               labels(n)[0] AS tl, coalesce(n.name_zh, '') AS tn
-        LIMIT 15
-    """,
-    "Type": """
-        MATCH (n:Type {id: $eid})
-        OPTIONAL MATCH (n)-[h:HITS_TYPE]->(m:Type)
-        WITH n, h, m
-        WHERE h IS NOT NULL
-        RETURN labels(n)[0] AS fl, coalesce(n.name_zh, n.id, '') AS fn,
-               type(h) AS rel,
-               labels(m)[0] AS tl, coalesce(m.name_zh, '') AS tn
-        UNION
-        MATCH (n:Type {id: $eid})
-        OPTIONAL MATCH (p:Type)-[r:HITS_TYPE]->(n)
-        WITH n, r, p
-        WHERE r IS NOT NULL
-        RETURN labels(p)[0] AS fl, coalesce(p.name_zh, p.id, '') AS fn,
-               type(r) AS rel,
-               labels(n)[0] AS tl, coalesce(n.name_zh, '') AS tn
-    """,
-}
 
 ENTITY_FACT_QUERIES = {
     "Pokemon": """
@@ -269,18 +194,11 @@ def dedupe_by_entity(items, limit=None):
     return out
 
 
-def get_driver():
-    return GraphDatabase.driver(
-        os.getenv("NEO4J_URL"),
-        auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD")),
-        notifications_disabled_classifications=["DEPRECATION"],
-    )
-
-
 class PokemonGraphRAG:
-    def __init__(self):
-        self.driver = get_driver()
-        self.db = os.getenv("NEO4J_DB")
+    def __init__(self, graph=None):
+        self.graph = graph or GraphAccess()
+        self.driver = self.graph.driver
+        self.db = self.graph.db
         self.fulltext_indexes = FULLTEXT_INDEXES
         self._fulltext_warned = set()
         self.embedder = ApiEmbedder()
@@ -564,36 +482,7 @@ class PokemonGraphRAG:
         }
 
     def subgraph(self, items, limit=3):
-        nodes = {}
-        edges = []
-        for item in items[:limit]:
-            label = item["metadata"]["entity_label"]
-            eid = item["metadata"]["entity_id"]
-            query = SUBGRAPH_QUERIES.get(label)
-            if not query:
-                continue
-            records, _, _ = self.driver.execute_query(
-                query, {"eid": eid},
-                database_=self.db,
-                routing_=RoutingControl.READ,
-            )
-            for rec in records:
-                fl, fn, rel, tl, tn = rec["fl"], rec["fn"], rec["rel"], rec["tl"], rec["tn"]
-                if not fn or not tn:
-                    continue
-                fid = f"{fl}:{fn}"
-                tid = f"{tl}:{tn}"
-                nodes[fid] = {"id": fid, "label": fn, "group": fl}
-                nodes[tid] = {"id": tid, "label": tn, "group": tl}
-                edges.append({"from": fid, "to": tid, "label": rel})
-        seen = set()
-        unique_edges = []
-        for e in edges:
-            key = (e["from"], e["to"], e["label"])
-            if key not in seen:
-                seen.add(key)
-                unique_edges.append(e)
-        return {"nodes": list(nodes.values()), "edges": unique_edges}
+        return self.graph.subgraph(items, limit)
 
     def close(self):
-        self.driver.close()
+        self.graph.close()
