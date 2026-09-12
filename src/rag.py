@@ -22,7 +22,7 @@ from neo4j_graphrag.llm import OpenAILLM
 from neo4j_graphrag.retrievers import VectorCypherRetriever
 from neo4j_graphrag.types import RetrieverResultItem
 
-from embedder import ApiEmbedder
+from embedder import make_embedder
 from graph_access import GraphAccess
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -30,6 +30,19 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 logger = logging.getLogger(__name__)
 
 VECTOR_INDEX = os.getenv("VECTOR_INDEX") or "embedding_Chunk"
+
+# 阶段二改进：few-shot 示例，针对招式筛选/双属性克制/资料不足三类弱项
+FEW_SHOT_EXAMPLES = """【示例1·招式筛选】
+问题：哪些火属性招式威力大于80？
+回答：根据图谱事实，火属性招式威力大于80的有：喷射火焰（90）、大字爆炎（110）、烈焰冲锋（120）。列表类问题要列出所有符合条件的项，不要只列一个。
+
+【示例2·双属性克制】
+问题：草+毒属性被什么属性克制？
+回答：草属性弱点：火、冰、飞行、虫、毒；毒属性弱点：地面、超能力。综合后毒属性抵消了草属性的毒弱点，最终弱点为：火、冰、飞行、超能力。双属性要分别分析再综合，注意抵消效果。
+
+【示例3·资料不足】
+问题：喷火龙和水箭龟谁的特攻更高？
+回答：资料不足（上下文中没有种族值数据）。上下文不足时直接说资料不足，不要猜测。"""
 
 # 全文索引：按实体标签命名，直接命中实体节点（增强库口径）。
 FULLTEXT_INDEXES = [i.strip() for i in (
@@ -201,7 +214,7 @@ class PokemonGraphRAG:
         self.db = self.graph.db
         self.fulltext_indexes = FULLTEXT_INDEXES
         self._fulltext_warned = set()
-        self.embedder = ApiEmbedder()
+        self.embedder = make_embedder()
         self.retriever = VectorCypherRetriever(
             self.driver,
             VECTOR_INDEX,
@@ -217,9 +230,14 @@ class PokemonGraphRAG:
         )
         self.prompt_template = RagTemplate(
             template=(
-                "你是一个宝可梦知识助手。请优先参考上下文中的【图谱结构化事实】和【检索文本块】准确回答问题。\n"
-                "如果上下文完全不足以回答，请直接说“资料不足”。\n\n"
-                "示例:\n{examples}\n\n"
+                "你是一个严谨的宝可梦知识助手，只根据给定上下文回答，绝不使用外部知识或猜测。\n\n"
+                "回答规则：\n"
+                "1. 优先使用【图谱结构化事实】中的精确数据（属性、进化等级、威力、编号等）。\n"
+                "2. 【检索文本块】作为补充说明。\n"
+                "3. 列表类问题要列出所有符合条件的项，不要只列一个。\n"
+                "4. 双属性问题要分别分析两个属性再综合，注意属性叠加后的抵消效果。\n"
+                "5. 如果上下文中没有足够信息，直接回答“资料不足”，不要编造或猜测。\n\n"
+                "{examples}\n\n"
                 "上下文:\n{context}\n\n"
                 "问题: {query_text}\n\n"
                 "回答:"
@@ -449,7 +467,7 @@ class PokemonGraphRAG:
 
         context = "\n\n".join(context_parts)
         prompt = self.prompt_template.format(
-            query_text=question, context=context, examples=""
+            query_text=question, context=context, examples=FEW_SHOT_EXAMPLES
         )
         resp = self.llm.invoke(prompt)
         return {
