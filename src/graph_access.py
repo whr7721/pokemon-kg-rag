@@ -13,6 +13,17 @@ from neo4j import GraphDatabase, RoutingControl
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
+ALIASES = {
+    "板匙蛇": "饭匙蛇",   # Seviper 旧称 -> 官方译名
+}
+
+
+def alias_normalize(question: str) -> str:
+    q = question
+    for k, v in ALIASES.items():
+        q = q.replace(k, v)
+    return q
+
 VECTOR_INDEX = os.getenv("VECTOR_INDEX") or "embedding_Chunk"
 FULLTEXT_INDEXES = [i.strip() for i in (
     os.getenv("FULLTEXT_INDEXES")
@@ -266,6 +277,28 @@ class GraphAccess:
             elif is_def:
                 best[r["ab"]]["hidden"] = best[r["ab"]]["hidden"] or hidden
         return best
+
+    def guess_ability(self, question: str):
+        """针对错字或俗称特性（悬浮->飘浮、蓄水->储水），按编辑距离找最接近的特性名。"""
+        abilities = [a for a in self.abilities() if 2 <= len(a) <= 4]
+        cands = []
+        for ab in abilities:
+            L = len(ab)
+            for width in (max(1, L - 1), L, L + 1):
+                for i in range(0, len(question) - width + 1):
+                    sub = question[i:i + width]
+                    d = sum(1 for c1, c2 in zip(ab, sub) if c1 != c2) + abs(len(ab) - len(sub))
+                    if d <= 1 and any(c in ab for c in sub):
+                        overlap = len(set(ab) & set(sub))
+                        cands.append((overlap, -d, ab))
+                        break
+        cands.sort(key=lambda x: (-x[0], -x[1], x[2]))
+        seen, res = set(), []
+        for o, d, a in cands:
+            if a not in seen:
+                seen.add(a)
+                res.append(a)
+        return res[:4]
 
     def paths(self, eid, depth=2, limit=10):
         """进化链证据路径。depth 只接受 1/2/3，其余按 2 处理。"""

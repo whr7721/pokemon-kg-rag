@@ -22,7 +22,7 @@ from neo4j_graphrag.retrievers import VectorCypherRetriever
 from neo4j_graphrag.types import RetrieverResultItem
 
 from embedder import ApiEmbedder
-from graph_access import METHOD_CN, GraphAccess
+from graph_access import ALIASES, METHOD_CN, GraphAccess, alias_normalize
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -135,7 +135,7 @@ ENTITY_FACT_QUERIES = {
         RETURN a.name_zh AS name, a.description AS description,
                coalesce(a.effect, a.description, a.text, '') AS effect,
                a.generation AS generation,
-               [x IN collect(DISTINCT p.name_zh) WHERE x IS NOT NULL][..8] AS pokemon_list
+               [x IN collect(DISTINCT p.name_zh) WHERE x IS NOT NULL][..30] AS pokemon_list
     """,
     "Type": """
         MATCH (t:Type {id: $eid})
@@ -254,7 +254,7 @@ class PokemonGraphRAG:
         """按问题意图返回检索计划（PolyG）。"""
         if any(k in question for k in ("招式", "技能")) and "威力" in question:
             return PLANS["move"]
-        if "特性" in question and not any(t in question for t in TYPES18):
+        if "特性" in question:
             return PLANS["ability"]
         if any(k in question for k in ("进化", "最终进化")):
             return PLANS["evolution"]
@@ -269,6 +269,7 @@ class PokemonGraphRAG:
 
         labels 来自检索计划；索引缺失或查询报错时不静默失败，打印警告并降级。
         """
+        question = alias_normalize(question)
         out = []
         for index in self.fulltext_indexes:
             try:
@@ -291,11 +292,20 @@ class PokemonGraphRAG:
                 if not name or name not in question:
                     continue
                 out.append(record_formatter(data))
+        # 错字/近似特性兜底：若计划要求 Ability 但未命中任何特性，按编辑距离找相近特性补入
+        if labels and "Ability" in labels and not any(it.metadata.get("entity_label") == "Ability" for it in out):
+            for gname in self.graph.guess_ability(question)[:3]:
+                out.append(record_formatter({
+                    "text": f"特性：{gname}（相近匹配）",
+                    "kind": "Ability", "entity_id": f"ability:{gname}",
+                    "entity_label": "Ability", "entity_name": gname, "score": 2.0,
+                }))
         out.sort(key=lambda it: it.metadata.get("score") or 0, reverse=True)
         return out
 
     def retrieve(self, question, top_k=8):
         """三路召回 + RRF 融合：向量 / 实体名全文 / 图扩展（KG²RAG）。"""
+        question = alias_normalize(question)
         plan = self._plan(question)
         vector = list(self.retriever.search(query_text=question, top_k=top_k * 4).items)
         by_name = self._name_hits(question, labels=plan["labels"], limit=top_k * 2)
@@ -357,7 +367,23 @@ class PokemonGraphRAG:
     def get_entity_facts(self, items, limit=3, labels=None):
         seen = set()
         entities = []
-        for it in items:
+        # 排序优先级：
+        # 0: 实体名在问题中直接出现的（提问主体，如“电击魔兽”“皮卡丘”，必不可漏）
+        # 1: 符合核心标签的实体（如问特性时的 Ability）
+        # 2: 其他辅助实体
+        candidate_items = items
+        def _item_priority(it):
+            md = it.get("metadata") or {}
+            name = str(md.get("entity_name") or "")
+            elab = md.get("entity_label")
+            # 提问主体排第一
+            is_subject = 1 if name and len(name) >= 2 and (name in getattr(self, "_cur_question", "") or name in str(it.get("text", ""))) else 2
+            # 主标签排第二
+            is_label = 0 if labels and elab in labels else 1
+            return (is_subject, is_label)
+        candidate_items = sorted(items, key=_item_priority)
+
+        for it in candidate_items:
             meta = it.get("metadata") or {}
             pair = (meta.get("entity_label"), meta.get("entity_id"))
             if pair[0] and pair[1] and pair not in seen:
@@ -435,7 +461,11 @@ class PokemonGraphRAG:
             return f"【招式】{rec.get('name')} 属性:{rec.get('type')} 分类:{rec.get('category')} 威力:{rec.get('power')} 命中:{rec.get('accuracy')} 说明:{rec.get('description')}"
         if label == "Ability":
             eff = rec.get("effect") or rec.get("description") or ""
-            return f"【特性】{rec.get('name')} 说明:{eff}"
+            lines = [f"【特性】{rec.get('name')} 说明:{eff}"]
+            pkm = rec.get("pokemon_list") or []
+            if pkm:
+                lines.append("  * 拥有该特性的宝可梦: " + "、".join(str(x) for x in pkm if x))
+            return "\n".join(lines)
         if label == "Type":
             lines = [f"【属性类型】{rec.get('name')}"]
             atk, weak, res = {}, {}, {}
@@ -476,14 +506,17 @@ class PokemonGraphRAG:
         return ""
 
     def ask(self, question, top_k=8, use_graph=True):
+        question = alias_normalize(question)
+        self._cur_question = question
         plan = self._plan(question)
         evidence = self.retrieve(question, top_k=top_k)
         fact_labels = plan["labels"]
-        facts = self.get_entity_facts(evidence, labels=fact_labels) if use_graph else []
+        flimit = 4 if fact_labels and "Ability" in fact_labels else 3
+        facts = self.get_entity_facts(evidence, limit=flimit, labels=fact_labels) if use_graph else []
         if use_graph and not facts and fact_labels:
             # 标签过滤过严时（如“某宝可梦有哪些特性”被判为 Ability，而召回到的是 Pokemon）
             # 回退到不限定标签，宁可多带事实也不要因过滤而变“资料不足”。
-            facts = self.get_entity_facts(evidence)
+            facts = self.get_entity_facts(evidence, limit=flimit)
         schema_facts = self._move_power_facts(question) if use_graph else []
         if schema_facts:
             facts = schema_facts + [f for f in facts if f["label"] != "Move"]
@@ -492,6 +525,19 @@ class PokemonGraphRAG:
         if facts:
             fact_texts = [self.format_fact(f, need=plan["need"]) for f in facts]
             context_parts.append("【图谱结构化事实】\n" + "\n\n".join(x for x in fact_texts if x))
+        # 策略第二跳：若问及携带/适合/对策或特性，调图谱把命中宝可梦的全部特性机制说明查出注入
+        if use_graph and (any(w in question for w in ("应对", "携带", "适合", "对策", "面对")) or "特性" in question):
+            pkm_names = [f["data"].get("name") for f in facts if f["label"] == "Pokemon" and f["data"].get("name")]
+            mech = []
+            for pname in pkm_names[:2]:
+                ab_rows = self.graph.ability_rows(pname)
+                for ab, info in ab_rows.items():
+                    tag = "隐藏" if info.get("hidden") else "普通"
+                    eff = str(info.get("eff") or info.get("dsc") or "").replace("\n", " ").strip()
+                    if eff:
+                        mech.append(f"  * 「{pname}」特性【{ab}】（{tag}）：{eff[:120]}")
+            if mech:
+                context_parts.append("【特性机制详情（供策略自判）】\n" + "\n".join(mech))
         if use_graph and plan["paths"]:
             for f in facts:
                 if f["label"] == "Pokemon":
@@ -502,6 +548,15 @@ class PokemonGraphRAG:
                     break
         if evidence:
             context_parts.append("【检索文本块】\n" + "\n\n".join(e["text"] for e in evidence))
+        # 相近特性提示：当输入特性名不精确时，显式把候选相近特性给到模型
+        # 相近特性提示：仅当问题询问特性持有者但特性名非官方名称时才给提示；策略题不提示，避免误导模型
+        if use_graph and "特性" in question and not any(w in question for w in ("携带", "适合", "应对", "对策", "面对")):
+            if not any(f["label"] == "Ability" and f["data"].get("name") in question for f in facts):
+                guessed = self.graph.guess_ability(question)
+                if len(guessed) >= 2:
+                    context_parts.append(
+                        f"【相近特性提示】若输入特性名非官方规范名称（如“蓄水”），请结合上下文列出的相近特性（{'、'.join(guessed[:2])}）一并说明拥有它们的宝可梦。"
+                    )
 
         context = "\n\n".join(context_parts)
         prompt = self.prompt_template.format(
