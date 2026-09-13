@@ -13,6 +13,17 @@ from neo4j import GraphDatabase, RoutingControl
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
+ALIASES = {
+    "板匙蛇": "饭匙蛇",   # Seviper 旧称 -> 官方译名
+}
+
+
+def alias_normalize(question: str) -> str:
+    q = question
+    for k, v in ALIASES.items():
+        q = q.replace(k, v)
+    return q
+
 VECTOR_INDEX = os.getenv("VECTOR_INDEX") or "embedding_Chunk"
 FULLTEXT_INDEXES = [i.strip() for i in (
     os.getenv("FULLTEXT_INDEXES")
@@ -29,52 +40,6 @@ NARRATIVE_CN = {
     "ALLIED_WITH": "结盟", "COMMENSAL_OF": "共生", "MENTOR_OF": "师徒",
     "SYMBIOTIC_WITH": "互利共生",
 }
-
-RETRIEVAL_QUERY = """
-MATCH (node)-[:DESCRIBES]->(e)
-OPTIONAL MATCH (par:Pokemon)-[:HAS_FORM]->(e)
-WITH node, score,
-     CASE WHEN par IS NOT NULL THEN par ELSE e END AS ent,
-     CASE WHEN par IS NOT NULL THEN 'Pokemon' ELSE labels(e)[0] END AS elab
-RETURN node.text AS text,
-       coalesce(node.entity_type, node.kind, '') AS kind,
-       CASE WHEN elab = 'Pokemon' THEN ent.pokedex_id
-            WHEN elab IN ['Move', 'Ability'] THEN ent.id
-            ELSE coalesce(ent.pokedex_id, ent.id, '') END AS entity_id,
-       elab AS entity_label,
-       coalesce(ent.name_zh, ent.form_name, toString(ent.num), '') AS entity_name,
-       score AS score
-"""
-
-NAME_HIT_QUERY = """
-CALL db.index.fulltext.queryNodes('{index}', $query_text) YIELD node, score
-WITH node, score
-OPTIONAL MATCH (par:Pokemon)-[:HAS_FORM]->(node)
-WITH node, score,
-     CASE WHEN par IS NOT NULL THEN par ELSE node END AS ent,
-     CASE WHEN par IS NOT NULL THEN 'Pokemon' ELSE labels(node)[0] END AS elab
-OPTIONAL MATCH (c:Chunk)-[:DESCRIBES]->(ent)
-WITH ent, elab, score, collect(c.text)[0] AS ctext
-RETURN left(coalesce(ctext, ent.text, ''), 700) AS text,
-       elab AS kind,
-       CASE WHEN elab = 'Pokemon' THEN ent.pokedex_id
-            WHEN elab IN ['Move', 'Ability'] THEN ent.id
-            ELSE coalesce(ent.pokedex_id, ent.id, '') END AS entity_id,
-       elab AS entity_label,
-       coalesce(ent.name_zh, ent.form_name, toString(ent.num), '') AS entity_name,
-       score AS score
-ORDER BY score DESC
-LIMIT $limit
-"""
-
-MOVE_POWER_QUERY = """
-MATCH (m:Move)
-WHERE toInteger(m.power) >= $threshold
-  AND ($move_types IS NULL OR m.type IN $move_types)
-RETURN m.name_zh AS name, m.type AS type, m.category AS category,
-       toInteger(m.power) AS power
-ORDER BY power DESC
-"""
 
 SUBGRAPH_QUERIES = {
     "Pokemon": """
@@ -152,65 +117,56 @@ SUBGRAPH_QUERIES = {
     """,
 }
 
-ENTITY_FACT_QUERIES = {
-    "Pokemon": """
-        MATCH (p:Pokemon {pokedex_id: $eid})
-        CALL (p) {
-            OPTIONAL MATCH (p)-[:HAS_FORM]->(:Form)-[:HAS_TYPE]->(t:Type)
-            OPTIONAL MATCH (t)-[h:HITS_TYPE]-(tgt:Type)
-            RETURN [x IN collect(DISTINCT t.name_zh) WHERE x IS NOT NULL] AS types,
-                   [x IN collect(DISTINCT {from: startNode(h).name_zh, to: endNode(h).name_zh, mult: h.multiplier})
-                    WHERE x.from IS NOT NULL AND x.to IS NOT NULL] AS type_chart
-        }
-        CALL (p) {
-            OPTIONAL MATCH (p)-[:HAS_FORM]->(:Form)-[ha:HAS_ABILITY]->(a:Ability)
-            RETURN [x IN collect(DISTINCT {name: a.name_zh, hidden: ha.hidden}) WHERE x.name IS NOT NULL] AS abilities
-        }
-        CALL (p) {
-            OPTIONAL MATCH (p)-[:HAS_FORM]->(:Form)-[:IN_EGG_GROUP]->(e:EggGroup)
-            RETURN [x IN collect(DISTINCT e.name_zh) WHERE x IS NOT NULL] AS egg_groups
-        }
-        CALL (p) {
-            OPTIONAL MATCH (prev:Pokemon)-[r_prev:EVOLVES_TO]->(p)
-            OPTIONAL MATCH (p)-[r_next:EVOLVES_TO]->(nxt:Pokemon)
-            OPTIONAL MATCH (p)-[:EVOLVES_TO]->(:Pokemon)-[r_final:EVOLVES_TO]->(final:Pokemon)
-            RETURN [x IN collect(DISTINCT {from: prev.name_zh, condition: r_prev.condition}) WHERE x.from IS NOT NULL] AS evolves_from,
-                   [x IN collect(DISTINCT {to: nxt.name_zh, condition: r_next.condition}) WHERE x.to IS NOT NULL] AS evolves_to,
-                   [x IN collect(DISTINCT {final: final.name_zh, condition: r_final.condition}) WHERE x.final IS NOT NULL] AS final_evolution
-        }
-        CALL (p) {
-            OPTIONAL MATCH (p)-[r_narr]->(other:Pokemon)
-            WHERE type(r_narr) IN ['PREDATES_ON','RIVAL_OF','ALLIED_WITH','COMPETES_WITH','COMMENSAL_OF','MENTOR_OF','SYMBIOTIC_WITH']
-            RETURN [x IN collect(DISTINCT {rel: type(r_narr), other: other.name_zh, evidence: properties(r_narr).evidence})
-                    WHERE x.other IS NOT NULL] AS narrative
-        }
-        RETURN p.name_zh AS name, p.pokedex_id AS id, p.category AS category,
-               types, type_chart, abilities, egg_groups, evolves_from, evolves_to, final_evolution, narrative
-    """,
-    "Move": """
-        MATCH (m:Move {id: $eid})
-        OPTIONAL MATCH (p:Pokemon)-[:HAS_FORM]->(:Form)-[:LEARNS]->(m)
-        RETURN m.name_zh AS name, m.type AS type, m.category AS category,
-               m.power AS power, m.accuracy AS accuracy, m.pp AS pp, m.description AS description,
-               [x IN collect(DISTINCT p.name_zh) WHERE x IS NOT NULL][..8] AS learned_by
-    """,
-    "Ability": """
-        MATCH (a:Ability {id: $eid})
-        OPTIONAL MATCH (p:Pokemon)-[:HAS_FORM]->(:Form)-[:HAS_ABILITY]->(a)
-        RETURN a.name_zh AS name, a.description AS description,
-               coalesce(a.effect, a.description, a.text, '') AS effect,
-               a.generation AS generation,
-               [x IN collect(DISTINCT p.name_zh) WHERE x IS NOT NULL][..8] AS pokemon_list
-    """,
-    "Type": """
-        MATCH (t:Type {id: $eid})
-        OPTIONAL MATCH (t)-[h:HITS_TYPE]->(def:Type)
-        OPTIONAL MATCH (att:Type)-[d:HITS_TYPE]->(t)
-        RETURN t.name_zh AS name,
-               [x IN collect(DISTINCT {to: def.name_zh, mult: h.multiplier}) WHERE x.to IS NOT NULL] AS attacks,
-               [x IN collect(DISTINCT {from: att.name_zh, mult: d.multiplier}) WHERE x.from IS NOT NULL] AS defenses
-    """,
+METHOD_CN = {
+    "level": "升级", "machine": "招式学习器", "egg": "蛋招式遗传",
+    "trade": "连接交换", "item": "使用道具", "friendship": "亲密度",
+    "beauty": "美丽度", "time": "时段条件", "weather": "天气条件",
+    "location": "特定地点", "gender": "性别条件", "other": "特殊条件",
 }
+
+# 进化链证据路径（PathRAG）；跳数不能参数化，只能字符串插值，深度白名单控制。
+PATH_QUERY_TMPL = """
+MATCH p = (a:Pokemon {pokedex_id: $eid})-[:EVOLVES_TO*1..%d]->(b)
+RETURN [n IN nodes(p) | coalesce(n.name_zh, n.id, '')] AS names,
+       [r IN relationships(p) | {method: r.method, condition: r.condition}] AS rels
+LIMIT $limit
+"""
+
+# 图引导召回扩展（KG²RAG）：进化家族 / 克制候选。
+RELATED_EVOLUTION_QUERY = """
+MATCH (a:Pokemon {pokedex_id: $eid})-[:EVOLVES_TO*1..2]-(b:Pokemon)
+RETURN DISTINCT b.pokedex_id AS eid
+LIMIT $limit
+"""
+
+DEFAULT_TYPES_QUERY = """
+MATCH (p:Pokemon {pokedex_id: $eid})-[hf:HAS_FORM]->(:Form)-[:HAS_TYPE]->(t:Type)
+WHERE toString(hf.default) IN ['True', 'true']
+RETURN DISTINCT t.name_zh AS t
+"""
+
+# 拥有指定属性（默认形态）的宝可梦。克制关系必须由完整受击倍率判定决定，
+# 不能靠单属性：地面克制火，但飞行免疫地面，喷火龙并不怕地面。
+TYPE_CANDIDATES_QUERY = """
+MATCH (p:Pokemon)-[hf:HAS_FORM]->(:Form)-[:HAS_TYPE]->(t:Type)
+WHERE t.name_zh IN $types AND p.pokedex_id <> $eid
+  AND toString(hf.default) IN ['True', 'true']
+RETURN DISTINCT p.pokedex_id AS eid
+LIMIT $limit
+"""
+
+CHUNKS_BY_ENTITY_QUERY = """
+MATCH (c:Chunk)-[:DESCRIBES]->(e:Pokemon)
+WHERE e.pokedex_id IN $ids
+RETURN c.text AS text,
+       coalesce(c.entity_type, c.kind, '') AS kind,
+       e.pokedex_id AS entity_id,
+       'Pokemon' AS entity_label,
+       coalesce(e.name_zh, '') AS entity_name,
+       0.0 AS score
+ORDER BY CASE WHEN c.kind = 'hit-profile' THEN 0 WHEN c.kind = 'relation' THEN 1 ELSE 2 END
+LIMIT $limit
+"""
 
 
 def get_driver():
@@ -321,6 +277,61 @@ class GraphAccess:
             elif is_def:
                 best[r["ab"]]["hidden"] = best[r["ab"]]["hidden"] or hidden
         return best
+
+    def guess_ability(self, question: str):
+        """针对错字或俗称特性（悬浮->飘浮、蓄水->储水），按编辑距离找最接近的特性名。"""
+        abilities = [a for a in self.abilities() if 2 <= len(a) <= 4]
+        cands = []
+        for ab in abilities:
+            L = len(ab)
+            for width in (max(1, L - 1), L, L + 1):
+                for i in range(0, len(question) - width + 1):
+                    sub = question[i:i + width]
+                    d = sum(1 for c1, c2 in zip(ab, sub) if c1 != c2) + abs(len(ab) - len(sub))
+                    if d <= 1 and any(c in ab for c in sub):
+                        overlap = len(set(ab) & set(sub))
+                        cands.append((overlap, -d, ab))
+                        break
+        cands.sort(key=lambda x: (-x[0], -x[1], x[2]))
+        seen, res = set(), []
+        for o, d, a in cands:
+            if a not in seen:
+                seen.add(a)
+                res.append(a)
+        return res[:4]
+
+    def paths(self, eid, depth=2, limit=10):
+        """进化链证据路径。depth 只接受 1/2/3，其余按 2 处理。"""
+        depth = depth if depth in (1, 2, 3) else 2
+        return self.run(PATH_QUERY_TMPL % depth, eid=eid, limit=limit)
+
+    def related_ids(self, eid, rule, limit=8):
+        """图引导召回的相关实体（rule ∈ {'evolution', 'counter'}）。"""
+        if rule == "evolution":
+            return [r["eid"] for r in self.run(RELATED_EVOLUTION_QUERY, eid=eid, limit=limit)]
+        if rule != "counter":
+            return []
+        types = [r["t"] for r in self.run(DEFAULT_TYPES_QUERY, eid=eid)]
+        if not types:
+            return []
+        chart = self.type_chart()
+        strong = []
+        for att, defenses in chart.items():
+            mult = 1.0
+            for t in types:
+                mult *= float(defenses.get(t, 1.0))
+            if mult >= 2:
+                strong.append(att)
+        if not strong:
+            return []
+        return [r["eid"] for r in self.run(
+            TYPE_CANDIDATES_QUERY, types=strong, eid=eid, limit=limit)]
+
+    def chunks_of(self, ids, limit=12):
+        """取指定宝可梦的文本块，形状与 record_formatter 的输入一致。"""
+        if not ids:
+            return []
+        return self.run(CHUNKS_BY_ENTITY_QUERY, ids=list(ids), limit=limit)
 
     def subgraph(self, items, limit=3):
         nodes = {}

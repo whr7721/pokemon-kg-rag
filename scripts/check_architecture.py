@@ -25,12 +25,20 @@ def function_names(name):
     return [n.name for n in ast.walk(tree(name)) if isinstance(n, ast.FunctionDef)]
 
 
+def direct_query_calls(name):
+    """策略模块里直接执行 Cypher 的地方（应全部走 GraphAccess）。"""
+    return [n for n in ast.walk(tree(name))
+            if isinstance(n, ast.Attribute) and n.attr in ("execute_query", "session")]
+
+
 assert "GraphDatabase" not in imported_names("multi_qa.py")
 assert "GraphDatabase" not in imported_names("rag.py")
 assert "GraphDatabase" not in imported_names("app.py")
 assert "get_driver" not in function_names("multi_qa.py")
 assert "get_driver" not in function_names("rag.py")
 assert "get_driver" in function_names("graph_access.py")
+assert not direct_query_calls("multi_qa.py")
+assert not direct_query_calls("rag.py")
 
 from router import RagRouter
 
