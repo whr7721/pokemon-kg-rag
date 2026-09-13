@@ -227,6 +227,14 @@ def rrf_fuse(rank_lists, k=RRF_K):
     return [items[key] for key in sorted(scores, key=lambda x: -scores[x])]
 
 
+RETRIEVAL_MODES = ("vector", "fulltext", "hybrid", "hybrid_graph")
+
+
+def normalize_retrieval_mode(mode):
+    """检索路径白名单：vector / fulltext / hybrid / hybrid_graph。"""
+    return mode if mode in RETRIEVAL_MODES else "hybrid_graph"
+
+
 class PokemonGraphRAG:
     def __init__(self, graph=None):
         self.graph = graph or GraphAccess()
@@ -321,15 +329,25 @@ class PokemonGraphRAG:
         out.sort(key=lambda it: it.metadata.get("score") or 0, reverse=True)
         return out
 
-    def retrieve(self, question, top_k=8):
-        """三路召回 + RRF 融合：向量 / 实体名全文 / 图扩展（KG²RAG）。"""
+    def retrieve(self, question, top_k=8, mode="hybrid_graph"):
+        """按检索路径召回：vector / fulltext / hybrid / hybrid_graph。"""
+        mode = normalize_retrieval_mode(mode)
         question = alias_normalize(question)
         plan = self._plan(question)
-        vector = list(self.retriever.search(query_text=question, top_k=top_k * 4).items)
-        by_name = self._name_hits(question, labels=plan["labels"], limit=top_k * 2)
-        expanded = self._graph_expand(vector + by_name, plan, limit=top_k * 2)
-        fused = rrf_fuse([vector, by_name, expanded], k=self.rrf_k)
-        return [{"text": it.content, "metadata": it.metadata} for it in fused[:top_k]]
+        if mode == "vector":
+            items = list(self.retriever.search(query_text=question, top_k=top_k).items)
+        elif mode == "fulltext":
+            items = self._name_hits(question, labels=plan["labels"], limit=top_k)
+        elif mode == "hybrid":
+            vector = list(self.retriever.search(query_text=question, top_k=top_k * 4).items)
+            by_name = self._name_hits(question, labels=plan["labels"], limit=top_k * 2)
+            items = rrf_fuse([vector, by_name], k=self.rrf_k)
+        else:
+            vector = list(self.retriever.search(query_text=question, top_k=top_k * 4).items)
+            by_name = self._name_hits(question, labels=plan["labels"], limit=top_k * 2)
+            expanded = self._graph_expand(vector + by_name, plan, limit=top_k * 2)
+            items = rrf_fuse([vector, by_name, expanded], k=self.rrf_k)
+        return [{"text": it.content, "metadata": it.metadata} for it in items[:top_k]]
 
     def _graph_expand(self, items, plan, limit=8):
         """KG²RAG：按计划的扩展规则找相关实体，再取它们的文本块。"""
@@ -523,11 +541,12 @@ class PokemonGraphRAG:
                 for x in moves[:30]))
         return ""
 
-    def ask(self, question, top_k=8, use_graph=True):
+    def ask(self, question, top_k=8, use_graph=True, retrieval_mode="hybrid_graph"):
         question = alias_normalize(question)
         self._cur_question = question
         plan = self._plan(question)
-        evidence = self.retrieve(question, top_k=top_k)
+        retrieval_mode = normalize_retrieval_mode(retrieval_mode)
+        evidence = self.retrieve(question, top_k=top_k, mode=retrieval_mode)
         fact_labels = plan["labels"]
         flimit = 4 if fact_labels and "Ability" in fact_labels else 3
         facts = self.get_entity_facts(evidence, limit=flimit, labels=fact_labels) if use_graph else []
@@ -586,6 +605,7 @@ class PokemonGraphRAG:
             "evidence": evidence,
             "facts": facts,
             "mode": "graph_rag" if use_graph else "naive_rag",
+            "retrieval_mode": retrieval_mode,
         }
 
     def health(self):

@@ -47,8 +47,10 @@ def ask():
         return jsonify({"error": "question is required"}), 400
     top_k = int(data.get("top_k", 8))
     use_graph = as_bool(data.get("use_graph", True))
+    retrieval_mode = (data.get("retrieval_mode") or "hybrid_graph").strip()
 
-    return jsonify(router.answer(question, top_k=top_k, use_graph=use_graph))
+    return jsonify(router.answer(question, top_k=top_k, use_graph=use_graph,
+                                  retrieval_mode=retrieval_mode))
 
 
 @app.get("/api/entity")
@@ -70,10 +72,12 @@ def compare():
     if not question:
         return jsonify({"error": "question is required"}), 400
     top_k = int(data.get("top_k", 8))
-    naive = router.rag.ask(question, top_k=top_k, use_graph=False)
-    graph = router.rag.ask(question, top_k=top_k, use_graph=True)
+    retrieval_mode = (data.get("retrieval_mode") or "hybrid_graph").strip()
+    naive = router.rag.ask(question, top_k=top_k, use_graph=False, retrieval_mode=retrieval_mode)
+    graph = router.rag.ask(question, top_k=top_k, use_graph=True, retrieval_mode=retrieval_mode)
     return jsonify({
         "question": question,
+        "retrieval_mode": retrieval_mode,
         "naive": {
             "answer": naive["answer"],
             "evidence": naive["evidence"],

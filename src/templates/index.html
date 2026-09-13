@@ -37,6 +37,9 @@
   .modes { display:inline-flex; background:#eef0f3; border-radius:8px; padding:3px; gap:3px; }
   .modebtn { background:transparent; border:none; color:var(--muted); padding:8px 14px; border-radius:6px; font-size:13px; font-weight:600; cursor:pointer; }
   .modebtn.active { background:#fff; color:var(--ink); box-shadow:0 1px 2px rgba(0,0,0,.08); }
+  .pathlabel { display:inline-flex; align-items:center; gap:8px; font-size:13px; color:var(--muted); }
+  select { padding:9px 10px; border:1px solid var(--line); border-radius:8px; font-size:13px; background:#fff; color:var(--ink); }
+  .badge.path { background:#0f766e; }
   .badge { font-size:11px; font-weight:700; color:#fff; background:#6b7280; border-radius:999px; padding:2px 8px; }
   .badge.graph_rag, .badge.naive_rag { background:#0ea5e9; }
   .badge.evolution, .badge.counter, .badge.ability, .badge.move, .badge.strategy, .badge.suggest, .badge.relation { background:#8b5cf6; }
@@ -63,16 +66,24 @@
       <input id="q" type="text" placeholder="例如：皮卡丘是什么属性？妙蛙种子最终进化成什么？">
       <button id="go">提问</button>
     </div>
-    <div style="display:flex;align-items:center;gap:10px;margin-top:10px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap;">
       <div class="modes">
         <button id="modeGraph" class="modebtn active">GraphRAG</button>
         <button id="modeCompare" class="modebtn">对照模式</button>
       </div>
+      <label class="pathlabel">检索路径
+        <select id="retrieval">
+          <option value="hybrid_graph">混合 + 图扩展（最终方案）</option>
+          <option value="hybrid">混合检索（向量 + 全文）</option>
+          <option value="vector">仅向量</option>
+          <option value="fulltext">仅全文</option>
+        </select>
+      </label>
     </div>
     <div class="chips" id="chips" style="margin-top:10px;"></div>
   </div>
   <div class="panel">
-    <h2>回答 <span id="modebadge" class="badge" hidden></span></h2>
+    <h2>回答 <span id="modebadge" class="badge" hidden></span> <span id="pathbadge" class="badge path" hidden></span></h2>
     <div id="answer">请输入问题，或点击下方示例问题快速体验。</div>
     <div id="compare" class="cmp" hidden></div>
   </div>
@@ -103,6 +114,9 @@ const NODE_ZH = {
 const MODE_ZH = {
   graph_rag:'GraphRAG', naive_rag:'普通 RAG', open:'开放问答', evolution:'进化',
   counter:'克制', ability:'特性', move:'招式', strategy:'策略', suggest:'建议', relation:'关系',
+};
+const RETRIEVAL_ZH = {
+  vector:'仅向量', fulltext:'仅全文', hybrid:'混合检索', hybrid_graph:'混合+图扩展',
 };
 const net = new vis.Network(document.getElementById('graph'), {nodes:new vis.DataSet(), edges:new vis.DataSet()}, {
   physics:true,
@@ -153,6 +167,12 @@ function setBadge(mode){
   if(zh){ b.textContent=zh; b.className='badge '+mode; b.hidden=false; }
   else { b.hidden=true; }
 }
+function setPathBadge(mode){
+  const b=document.getElementById('pathbadge');
+  const zh=RETRIEVAL_ZH[mode];
+  if(zh){ b.textContent='检索：'+zh; b.hidden=false; }
+  else { b.hidden=true; }
+}
 function renderEvidence(list){
   const ev=document.getElementById('evidence'); ev.innerHTML='';
   (list||[]).forEach(e=>{
@@ -190,6 +210,7 @@ let busy=false;
 async function ask(){
   if(busy) return;
   const q=document.getElementById('q').value.trim();
+  const rmode=document.getElementById('retrieval').value;
   if(!q) return;
   busy=true;
   const btn=document.getElementById('go'), ans=document.getElementById('answer'), cmp=document.getElementById('compare');
@@ -206,9 +227,9 @@ async function ask(){
   try{
     let url, body;
     if(view==='compare'){
-      url='/api/compare'; body={question:q};
+      url='/api/compare'; body={question:q, retrieval_mode:rmode};
     } else {
-      url='/api/ask'; body={question:q, use_graph:true};
+      url='/api/ask'; body={question:q, use_graph:true, retrieval_mode:rmode};
     }
     const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:ctl.signal});
     if(!res.ok) throw new Error('服务返回 '+res.status);
@@ -216,15 +237,18 @@ async function ask(){
     if(data.error) throw new Error(data.error);
     if(view==='compare'){
       ans.hidden=true;
+      document.getElementById('modebadge').hidden=true;
+      setPathBadge(data.retrieval_mode);
       renderCompare(data);
       const g=data.graph||{};
       renderEvidence(g.evidence||[]);
-      const tag=document.getElementById('evtag'); tag.textContent='GraphRAG 证据'; tag.style.display='inline-block';
+      const tag=document.getElementById('evtag'); tag.textContent=(RETRIEVAL_ZH[data.retrieval_mode]||'')+' GraphRAG 证据'; tag.style.display='inline-block';
       drawGraph(g.subgraph);
     } else {
       cmp.hidden=true;
       ans.textContent=data.answer||'无回答';
       setBadge(data.mode||'graph_rag');
+      setPathBadge(data.retrieval_mode);
       renderEvidence(data.evidence||[]);
       drawGraph(data.subgraph);
     }
