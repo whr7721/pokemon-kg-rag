@@ -333,6 +333,70 @@ class GraphAccess:
             return []
         return self.run(CHUNKS_BY_ENTITY_QUERY, ids=list(ids), limit=limit)
 
+    def entity_detail(self, label, name):
+        """返回实体的关键字段，供前端点击子图节点查看。"""
+        if label == "Pokemon":
+            rows = self.run("""
+                MATCH (p:Pokemon {name_zh: $name})
+                OPTIONAL MATCH (p)-[:HAS_FORM]->(f:Form)
+                OPTIONAL MATCH (f)-[:HAS_TYPE]->(t:Type)
+                OPTIONAL MATCH (f)-[:HAS_ABILITY]->(a:Ability)
+                RETURN p.pokedex_id AS dex, p.category AS category,
+                       p.description AS description, p.text AS text,
+                       collect(DISTINCT t.name_zh) AS types,
+                       collect(DISTINCT a.name_zh) AS abilities
+            """, name=name)
+            if not rows:
+                return None
+            r = rows[0]
+            return {"label": "Pokemon", "name": name, "fields": [
+                {"k": "图鉴编号", "v": r["dex"]},
+                {"k": "分类", "v": r["category"] or ""},
+                {"k": "属性", "v": "、".join(x for x in (r["types"] or []) if x)},
+                {"k": "特性", "v": "、".join(x for x in (r["abilities"] or []) if x)},
+                {"k": "简介", "v": (r["description"] or "")},
+                {"k": "图鉴描述", "v": (r["text"] or "")[:600]},
+            ]}
+        if label == "Move":
+            rows = self.run("""
+                MATCH (m:Move {name_zh: $name})
+                RETURN m.type AS type, m.category AS category, m.power AS power,
+                       m.accuracy AS accuracy, m.pp AS pp, m.description AS description
+            """, name=name)
+            if not rows:
+                return None
+            r = rows[0]
+            return {"label": "Move", "name": name, "fields": [
+                {"k": "属性", "v": r["type"] or ""},
+                {"k": "分类", "v": r["category"] or ""},
+                {"k": "威力", "v": r["power"]},
+                {"k": "命中", "v": r["accuracy"]},
+                {"k": "PP", "v": r["pp"]},
+                {"k": "说明", "v": (r["description"] or "")[:600]},
+            ]}
+        if label == "Ability":
+            rows = self.run("""
+                MATCH (a:Ability {name_zh: $name})
+                RETURN a.description AS description, a.effect AS effect
+            """, name=name)
+            if not rows:
+                return None
+            r = rows[0]
+            return {"label": "Ability", "name": name, "fields": [
+                {"k": "说明", "v": (r["description"] or "")[:600]},
+                {"k": "效果", "v": (r["effect"] or "")[:600]},
+            ]}
+        if label in ("Type", "EggGroup", "RegionDex"):
+            rows = self.run(
+                "MATCH (n:`" + label + "` {name_zh: $name}) RETURN n.text AS text",
+                name=name)
+            if not rows:
+                return None
+            return {"label": label, "name": name, "fields": [
+                {"k": "说明", "v": (rows[0]["text"] or "")[:600]},
+            ]}
+        return None
+
     def subgraph(self, items, limit=3):
         nodes = {}
         edges = []
