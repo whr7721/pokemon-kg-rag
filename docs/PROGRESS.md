@@ -17,5 +17,6 @@
 - [x] 用最终整合代码重跑 `scripts/run_eval.py` + `scripts/score_eval.py`，让评测结果与最终混合检索一致（GraphRAG 4.05/5、77%；naive RAG 2.86/5、50%；structured 1.41/5、27%）
 - [x] `docs/evaluation.md` 与最终代码口径对齐
 - [x] `scripts/run_ablation.py` 重跑四路消融并对齐 `docs/retrieval.md`（vector 9/19、fulltext 3/19、hybrid 9/19、hybrid_graph 14/19）
-- [ ] README、架构图、演示脚本、汇报 PPT（成员五）
+- [x] README 重写（阶段二架构、图谱规模、复现流水线、API、评测结果，并同步英文版）
+- [ ] 架构图、演示脚本、汇报 PPT（成员五）
 - [ ] 最终核对后打 tag `v1.0-stage2`
