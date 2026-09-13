@@ -1,9 +1,8 @@
-"""向量化封装：OpenAI 兼容 embeddings（SiliconFlow / DashScope 等）。
+"""向量化封装：本地 BGE-M3（默认）或云端 API。
 
-统一使用云端 API，不依赖本地 torch / sentence-transformers：
-    EMBED_ENDPOINT  向量服务端点（如 https://api.siliconflow.cn/v1/embeddings）
-    EMBED_MODEL     模型名（默认 BAAI/bge-m3，1024 维）
-    EMBED_API_KEY   访问密钥（兼容 EMBED_KEY）
+通过 .env 的 EMBED_ENGINE 选择：
+    EMBED_ENGINE=bge   -> BgeM3Embedder（默认，本地 sentence-transformers）
+    EMBED_ENGINE=api   -> ApiEmbedder（SiliconFlow / DashScope 等 OpenAI 兼容）
 """
 from __future__ import annotations
 
@@ -14,10 +13,32 @@ import urllib.request
 from dotenv import load_dotenv
 
 load_dotenv()
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+
+class BgeM3Embedder:
+    """本地 BGE-M3 向量化封装。"""
+
+    def __init__(self, model_name=None):
+        from sentence_transformers import SentenceTransformer
+        self.model_name = model_name or os.getenv("EMBED_MODEL", "BAAI/bge-m3")
+        self.model = SentenceTransformer(self.model_name)
+
+    def embed_texts(self, texts, batch_size=32):
+        return self.model.encode(
+            texts,
+            normalize_embeddings=True,
+            batch_size=batch_size,
+            show_progress_bar=True,
+        ).tolist()
+
+    def embed_query(self, text):
+        vec = self.model.encode([text], normalize_embeddings=True)
+        return vec[0].tolist()
 
 
 class ApiEmbedder:
-    """OpenAI 兼容 embeddings 客户端。"""
+    """OpenAI 兼容 embeddings 客户端（SiliconFlow / DashScope 等）。"""
 
     def __init__(self, endpoint=None, api_key=None, model=None):
         self.endpoint = endpoint or os.getenv("EMBED_ENDPOINT")
@@ -36,7 +57,6 @@ class ApiEmbedder:
         })
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        # 按返回的 index 排序，避免服务端乱序导致向量与文本错位
         return [item["embedding"] for item in sorted(data["data"], key=lambda x: x["index"])]
 
     def embed_texts(self, texts, batch_size=32):
@@ -47,3 +67,11 @@ class ApiEmbedder:
 
     def embed_query(self, text):
         return self._call([text])[0]
+
+
+def make_embedder(engine=None):
+    """按 EMBED_ENGINE 返回对应 embedder，默认本地 BGE-M3。"""
+    engine = (engine or os.getenv("EMBED_ENGINE") or "bge").lower()
+    if engine in ("api", "dashscope", "siliconflow"):
+        return ApiEmbedder()
+    return BgeM3Embedder()

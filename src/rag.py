@@ -16,20 +16,32 @@ import re
 from pathlib import Path
 
 from dotenv import load_dotenv
-from neo4j import RoutingControl
 from neo4j_graphrag.generation import RagTemplate
 from neo4j_graphrag.llm import OpenAILLM
 from neo4j_graphrag.retrievers import VectorCypherRetriever
 from neo4j_graphrag.types import RetrieverResultItem
 
 from embedder import ApiEmbedder
-from graph_access import GraphAccess
+from graph_access import ALIASES, METHOD_CN, GraphAccess, alias_normalize
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 logger = logging.getLogger(__name__)
 
 VECTOR_INDEX = os.getenv("VECTOR_INDEX") or "embedding_Chunk"
+
+# 阶段二改进：few-shot 示例，针对招式筛选/双属性克制/资料不足三类弱项
+FEW_SHOT_EXAMPLES = """【示例1·招式筛选】
+问题：哪些火属性招式威力大于80？
+回答：根据图谱事实，火属性招式威力大于80的有：喷射火焰（90）、大字爆炎（110）、烈焰冲锋（120）。列表类问题要列出所有符合条件的项，不要只列一个。
+
+【示例2·双属性克制】
+问题：草+毒属性被什么属性克制？
+回答：草属性弱点：火、冰、飞行、虫、毒；毒属性弱点：地面、超能力。综合后毒属性抵消了草属性的毒弱点，最终弱点为：火、冰、飞行、超能力。双属性要分别分析再综合，注意抵消效果。
+
+【示例3·资料不足】
+问题：喷火龙和水箭龟谁的特攻更高？
+回答：资料不足（上下文中没有种族值数据）。上下文不足时直接说资料不足，不要猜测。"""
 
 # 全文索引：按实体标签命名，直接命中实体节点（增强库口径）。
 FULLTEXT_INDEXES = [i.strip() for i in (
@@ -136,7 +148,7 @@ ENTITY_FACT_QUERIES = {
         RETURN a.name_zh AS name, a.description AS description,
                coalesce(a.effect, a.description, a.text, '') AS effect,
                a.generation AS generation,
-               [x IN collect(DISTINCT p.name_zh) WHERE x IS NOT NULL][..8] AS pokemon_list
+               [x IN collect(DISTINCT p.name_zh) WHERE x IS NOT NULL][..30] AS pokemon_list
     """,
     "Type": """
         MATCH (t:Type {id: $eid})
@@ -177,38 +189,58 @@ def record_formatter(record):
     )
 
 
-def dedupe_by_entity(items, limit=None):
-    """同一实体多个文本块只保留召回分最高的一条，保持召回顺序。"""
-    seen, out = set(), []
-    for item in items:
-        md = item.metadata
-        key = (md.get("entity_label"), md.get("entity_id"))
-        if not all(key):
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(item)
-        if limit and len(out) >= limit:
-            break
-    return out
+RRF_K = 60   # Reciprocal Rank Fusion 平滑常数，越大越平缓
+
+# 查询感知的检索计划（PolyG）：labels 过滤实体类型，need 裁剪事实段落，
+# paths 控制证据路径跳数，expand 决定图引导召回的扩展规则。
+PLANS = {
+    "evolution": {"labels": {"Pokemon"}, "need": {"types", "abilities", "evolution"},
+                  "paths": 2, "expand": "evolution"},
+    "counter": {"labels": {"Type", "Pokemon"}, "need": {"types"},
+                "paths": 0, "expand": "counter"},
+    "ability": {"labels": {"Ability", "Pokemon"}, "need": {"abilities"},
+                "paths": 1, "expand": None},
+    "move": {"labels": {"Move"}, "need": {"move"}, "paths": 0, "expand": None},
+    "open": {"labels": None, "need": None, "paths": 1, "expand": None},
+}
+
+
+def rrf_fuse(rank_lists, k=RRF_K):
+    """Reciprocal Rank Fusion：按各路名次倒数求和后重排。
+
+    向量余弦与全文 BM25 的分数尺度不可比，直接加权求和需要额外归一化和调参；
+    RRF 只看名次，天然规避这个问题。缺实体键的条目直接丢弃（无法去重对齐）。
+    单路内同一实体只计最高名次一次，避免单个实体的多个低位分块因重复累加而挤掉真正相关的实体。
+    """
+    scores, items = {}, {}
+    for rank_list in rank_lists:
+        seen_in_list = set()
+        for rank, item in enumerate(rank_list):
+            key = (item.metadata.get("entity_label"), item.metadata.get("entity_id"))
+            if not all(key):
+                continue
+            if key in seen_in_list:
+                continue
+            seen_in_list.add(key)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+            items.setdefault(key, item)
+    return [items[key] for key in sorted(scores, key=lambda x: -scores[x])]
 
 
 class PokemonGraphRAG:
     def __init__(self, graph=None):
         self.graph = graph or GraphAccess()
-        self.driver = self.graph.driver
-        self.db = self.graph.db
         self.fulltext_indexes = FULLTEXT_INDEXES
         self._fulltext_warned = set()
+        self.rrf_k = int(os.getenv("RRF_K") or RRF_K)
         self.embedder = ApiEmbedder()
         self.retriever = VectorCypherRetriever(
-            self.driver,
+            self.graph.driver,
             VECTOR_INDEX,
             RETRIEVAL_QUERY,
             self.embedder,
             result_formatter=record_formatter,
-            neo4j_database=self.db,
+            neo4j_database=self.graph.db,
         )
         self.llm = OpenAILLM(
             model_name=os.getenv("LLM_MODEL", "tju-llm"),
@@ -217,9 +249,14 @@ class PokemonGraphRAG:
         )
         self.prompt_template = RagTemplate(
             template=(
-                "你是一个宝可梦知识助手。请优先参考上下文中的【图谱结构化事实】和【检索文本块】准确回答问题。\n"
-                "如果上下文完全不足以回答，请直接说“资料不足”。\n\n"
-                "示例:\n{examples}\n\n"
+                "你是一个严谨的宝可梦知识助手，只根据给定上下文回答，绝不使用外部知识或猜测。\n\n"
+                "回答规则：\n"
+                "1. 优先使用【图谱结构化事实】中的精确数据（属性、进化等级、威力、编号等）。\n"
+                "2. 【检索文本块】作为补充说明。\n"
+                "3. 列表类问题要列出所有符合条件的项，不要只列一个。\n"
+                "4. 双属性问题要分别分析两个属性再综合，注意属性叠加后的抵消效果。\n"
+                "5. 如果上下文中没有足够信息，直接回答“资料不足”，不要编造或猜测。\n\n"
+                "{examples}\n\n"
                 "上下文:\n{context}\n\n"
                 "问题: {query_text}\n\n"
                 "回答:"
@@ -231,34 +268,33 @@ class PokemonGraphRAG:
             logger.warning(warn)
 
     @staticmethod
-    def _candidate_labels(question):
-        labels = set()
+    def _plan(question):
+        """按问题意图返回检索计划（PolyG）。"""
         if any(k in question for k in ("招式", "技能")) and "威力" in question:
-            labels.add("Move")
-        elif "特性" in question and not any(t in question for t in TYPES18):
-            labels.add("Ability")
-        elif any(k in question for k in ("进化", "最终进化")):
-            labels.add("Pokemon")
-        elif any(t in question for t in TYPES18) and any(
-            k in question for k in ("克制", "攻击", "弱点", "弱于", "怕", "免疫")
+            return PLANS["move"]
+        if "特性" in question:
+            return PLANS["ability"]
+        if any(k in question for k in ("进化", "最终进化")):
+            return PLANS["evolution"]
+        if any(k in question for k in ("克制", "弱点", "弱于", "怕", "天敌")) or (
+            any(t in question for t in TYPES18) and any(k in question for k in ("攻击", "免疫"))
         ):
-            labels.add("Type")
-        return labels or None
+            return PLANS["counter"]
+        return PLANS["open"]
 
-    def _name_hits(self, question, limit=10):
+    def _name_hits(self, question, labels=None, limit=10):
         """全文索引按实体名召回，并把只与问题完全匹配的实体留下。
 
-        索引缺失或查询报错时不静默失败：打印警告并降级为仅向量召回。
+        labels 来自检索计划；索引缺失或查询报错时不静默失败，打印警告并降级。
         """
-        labels = self._candidate_labels(question)
+        question = alias_normalize(question)
         out = []
         for index in self.fulltext_indexes:
             try:
-                records, _, _ = self.driver.execute_query(
+                rows = self.graph.run(
                     NAME_HIT_QUERY.format(index=index),
-                    {"query_text": question, "limit": max(limit, 20)},
-                    database_=self.db,
-                    routing_=RoutingControl.READ,
+                    query_text=question,
+                    limit=max(limit, 20),
                 )
             except Exception as exc:
                 if index not in self._fulltext_warned:
@@ -267,29 +303,71 @@ class PokemonGraphRAG:
                         "全文索引 '%s' 不可用，本次降级为仅向量召回：%s", index, exc
                     )
                 continue
-            for rec in records:
-                data = rec.data()
+            for data in rows:
                 if labels and data.get("entity_label") not in labels:
                     continue
                 name = str(data.get("entity_name") or "")
                 if not name or name not in question:
                     continue
                 out.append(record_formatter(data))
+        # 错字/近似特性兜底：若计划要求 Ability 但未命中任何特性，按编辑距离找相近特性补入
+        if labels and "Ability" in labels and not any(it.metadata.get("entity_label") == "Ability" for it in out):
+            for gname in self.graph.guess_ability(question)[:3]:
+                out.append(record_formatter({
+                    "text": f"特性：{gname}（相近匹配）",
+                    "kind": "Ability", "entity_id": f"ability:{gname}",
+                    "entity_label": "Ability", "entity_name": gname, "score": 2.0,
+                }))
         out.sort(key=lambda it: it.metadata.get("score") or 0, reverse=True)
         return out
 
     def retrieve(self, question, top_k=8):
-        # 两路各自多取候选（向量 ×4、实体名 ×2），合并去重后再截断到 top_k，
-        # 避免去重后不同实体不足。
-        result = self.retriever.search(query_text=question, top_k=top_k * 4)
-        items = dedupe_by_entity(
-            self._name_hits(question, limit=top_k * 2) + list(result.items),
-            limit=top_k,
-        )
-        return [
-            {"text": item.content, "metadata": item.metadata}
-            for item in items
-        ]
+        """三路召回 + RRF 融合：向量 / 实体名全文 / 图扩展（KG²RAG）。"""
+        question = alias_normalize(question)
+        plan = self._plan(question)
+        vector = list(self.retriever.search(query_text=question, top_k=top_k * 4).items)
+        by_name = self._name_hits(question, labels=plan["labels"], limit=top_k * 2)
+        expanded = self._graph_expand(vector + by_name, plan, limit=top_k * 2)
+        fused = rrf_fuse([vector, by_name, expanded], k=self.rrf_k)
+        return [{"text": it.content, "metadata": it.metadata} for it in fused[:top_k]]
+
+    def _graph_expand(self, items, plan, limit=8):
+        """KG²RAG：按计划的扩展规则找相关实体，再取它们的文本块。"""
+        rule = plan.get("expand")
+        if not rule:
+            return []
+        seeds = []
+        for item in items:
+            md = item.metadata
+            eid = md.get("entity_id")
+            if md.get("entity_label") == "Pokemon" and eid and eid not in seeds:
+                seeds.append(eid)
+            if len(seeds) >= 2:
+                break
+        if not seeds:
+            return []
+        ids = list(seeds)
+        for eid in seeds:
+            for rid in self.graph.related_ids(eid, rule, limit=limit):
+                if rid not in ids:
+                    ids.append(rid)
+        return [record_formatter(row) for row in self.graph.chunks_of(ids[:limit], limit=limit)]
+
+    def format_paths(self, rows):
+        """PathRAG：把进化路径渲染为带条件的箭头串。"""
+        lines = []
+        for row in rows or []:
+            names, rels = row.get("names") or [], row.get("rels") or []
+            if len(names) < 2:
+                continue
+            text = names[0]
+            for i, rel in enumerate(rels):
+                step = "、".join(x for x in (
+                    METHOD_CN.get(rel.get("method"), rel.get("method") or ""),
+                    rel.get("condition") or "") if x)
+                text += f"--[{step or '特殊'}]--> {names[i + 1]}"
+            lines.append("  * " + text)
+        return "【图谱证据路径】\n" + "\n".join(lines) if lines else ""
 
     def _move_power_facts(self, question):
         """招式+威力条件问题：直接从图里取候选招式作为结构化事实。"""
@@ -297,19 +375,33 @@ class PokemonGraphRAG:
         if not m or not any(k in question for k in ("招式", "技能")):
             return []
         wanted_types = [t for t in TYPES18 if t in question]
-        records, _, _ = self.driver.execute_query(
+        moves = self.graph.run(
             MOVE_POWER_QUERY,
-            {"threshold": int(m.group(1)), "move_types": wanted_types or None},
-            database_=self.db,
-            routing_=RoutingControl.READ,
+            threshold=int(m.group(1)),
+            move_types=wanted_types or None,
         )
-        moves = [rec.data() for rec in records]
         return [{"label": "MoveFilter", "data": {"moves": moves}}] if moves else []
 
     def get_entity_facts(self, items, limit=3, labels=None):
         seen = set()
         entities = []
-        for it in items:
+        # 排序优先级：
+        # 0: 实体名在问题中直接出现的（提问主体，如“电击魔兽”“皮卡丘”，必不可漏）
+        # 1: 符合核心标签的实体（如问特性时的 Ability）
+        # 2: 其他辅助实体
+        candidate_items = items
+        def _item_priority(it):
+            md = it.get("metadata") or {}
+            name = str(md.get("entity_name") or "")
+            elab = md.get("entity_label")
+            # 提问主体排第一
+            is_subject = 1 if name and len(name) >= 2 and (name in getattr(self, "_cur_question", "") or name in str(it.get("text", ""))) else 2
+            # 主标签排第二
+            is_label = 0 if labels and elab in labels else 1
+            return (is_subject, is_label)
+        candidate_items = sorted(items, key=_item_priority)
+
+        for it in candidate_items:
             meta = it.get("metadata") or {}
             pair = (meta.get("entity_label"), meta.get("entity_id"))
             if pair[0] and pair[1] and pair not in seen:
@@ -325,36 +417,35 @@ class PokemonGraphRAG:
             query = ENTITY_FACT_QUERIES.get(label)
             if not query:
                 continue
-            records, _, _ = self.driver.execute_query(
-                query, {"eid": eid}, database_=self.db, routing_=RoutingControl.READ
-            )
-            if records:
-                facts.append({"label": label, "data": records[0].data()})
+            rows = self.graph.run(query, eid=eid)
+            if rows:
+                facts.append({"label": label, "data": rows[0]})
         return facts
 
-    def format_fact(self, fact):
+    def format_fact(self, fact, need=None):
+        """渲染单条图谱事实。need 为 None 时输出全部段落，否则只输出命中的部分。"""
         rec, label = fact.get("data") or {}, fact.get("label")
         if not rec:
             return ""
         if label == "Pokemon":
             types_str = " / ".join(rec.get("types") or [])
             lines = [f"【宝可梦】{rec.get('name')}(编号:{rec.get('id')}) 属性:{types_str} 分类:{rec.get('category','')}"]
-            if rec.get("abilities"):
+            if (need is None or "abilities" in need) and rec.get("abilities"):
                 lines.append("  * 特性: " + "、".join(
                     f"{a['name']}(隐藏)" if as_bool(a.get("hidden")) else a['name']
                     for a in rec["abilities"]))
-            if rec.get("egg_groups"):
+            if need is None and rec.get("egg_groups"):
                 lines.append("  * 蛋群: " + "、".join(rec["egg_groups"]))
-            if rec.get("evolves_from"):
+            if (need is None or "evolution" in need) and rec.get("evolves_from"):
                 lines.append("  * 前置进化: " + "；".join(
                     f"{x['from']}({x.get('condition') or '常规'})" for x in rec["evolves_from"]))
-            if rec.get("evolves_to"):
+            if (need is None or "evolution" in need) and rec.get("evolves_to"):
                 lines.append("  * 后续进化: " + "；".join(
                     f"{x['to']}({x.get('condition') or '常规'})" for x in rec["evolves_to"]))
-            if rec.get("final_evolution"):
+            if (need is None or "evolution" in need) and rec.get("final_evolution"):
                 lines.append("  * 最终进化: " + "；".join(
                     f"{x['final']}({x.get('condition') or '常规'})" for x in rec["final_evolution"]))
-            types = rec.get("types") or []
+            types = rec.get("types") if (need is None or "types" in need) else []
             chart = rec.get("type_chart") or []
             for t in types:
                 atk = {}
@@ -378,7 +469,7 @@ class PokemonGraphRAG:
                     lines.append("  * %s防守: " % t + "、".join(
                         "%sx[%s]" % (m, "、".join(sorted(set(v))))
                         for m, v in sorted(dfs.items(), reverse=True)))
-            if rec.get("narrative"):
+            if need is None and rec.get("narrative"):
                 for n in rec["narrative"]:
                     ev = ("(证据: %s)" % n["evidence"]) if n.get("evidence") else ""
                     lines.append("  * 生态关系: %s【%s】%s" % (
@@ -388,7 +479,11 @@ class PokemonGraphRAG:
             return f"【招式】{rec.get('name')} 属性:{rec.get('type')} 分类:{rec.get('category')} 威力:{rec.get('power')} 命中:{rec.get('accuracy')} 说明:{rec.get('description')}"
         if label == "Ability":
             eff = rec.get("effect") or rec.get("description") or ""
-            return f"【特性】{rec.get('name')} 说明:{eff}"
+            lines = [f"【特性】{rec.get('name')} 说明:{eff}"]
+            pkm = rec.get("pokemon_list") or []
+            if pkm:
+                lines.append("  * 拥有该特性的宝可梦: " + "、".join(str(x) for x in pkm if x))
+            return "\n".join(lines)
         if label == "Type":
             lines = [f"【属性类型】{rec.get('name')}"]
             atk, weak, res = {}, {}, {}
@@ -429,27 +524,61 @@ class PokemonGraphRAG:
         return ""
 
     def ask(self, question, top_k=8, use_graph=True):
+        question = alias_normalize(question)
+        self._cur_question = question
+        plan = self._plan(question)
         evidence = self.retrieve(question, top_k=top_k)
-        fact_labels = self._candidate_labels(question)
-        facts = self.get_entity_facts(evidence, labels=fact_labels) if use_graph else []
+        fact_labels = plan["labels"]
+        flimit = 4 if fact_labels and "Ability" in fact_labels else 3
+        facts = self.get_entity_facts(evidence, limit=flimit, labels=fact_labels) if use_graph else []
         if use_graph and not facts and fact_labels:
             # 标签过滤过严时（如“某宝可梦有哪些特性”被判为 Ability，而召回到的是 Pokemon）
             # 回退到不限定标签，宁可多带事实也不要因过滤而变“资料不足”。
-            facts = self.get_entity_facts(evidence)
+            facts = self.get_entity_facts(evidence, limit=flimit)
         schema_facts = self._move_power_facts(question) if use_graph else []
         if schema_facts:
             facts = schema_facts + [f for f in facts if f["label"] != "Move"]
 
         context_parts = []
         if facts:
-            fact_texts = [self.format_fact(f) for f in facts]
+            fact_texts = [self.format_fact(f, need=plan["need"]) for f in facts]
             context_parts.append("【图谱结构化事实】\n" + "\n\n".join(x for x in fact_texts if x))
+        # 策略第二跳：若问及携带/适合/对策或特性，调图谱把命中宝可梦的全部特性机制说明查出注入
+        if use_graph and (any(w in question for w in ("应对", "携带", "适合", "对策", "面对")) or "特性" in question):
+            pkm_names = [f["data"].get("name") for f in facts if f["label"] == "Pokemon" and f["data"].get("name")]
+            mech = []
+            for pname in pkm_names[:2]:
+                ab_rows = self.graph.ability_rows(pname)
+                for ab, info in ab_rows.items():
+                    tag = "隐藏" if info.get("hidden") else "普通"
+                    eff = str(info.get("eff") or info.get("dsc") or "").replace("\n", " ").strip()
+                    if eff:
+                        mech.append(f"  * 「{pname}」特性【{ab}】（{tag}）：{eff[:120]}")
+            if mech:
+                context_parts.append("【特性机制详情（供策略自判）】\n" + "\n".join(mech))
+        if use_graph and plan["paths"]:
+            for f in facts:
+                if f["label"] == "Pokemon":
+                    path_text = self.format_paths(
+                        self.graph.paths(f["data"].get("id"), depth=plan["paths"]))
+                    if path_text:
+                        context_parts.append(path_text)
+                    break
         if evidence:
             context_parts.append("【检索文本块】\n" + "\n\n".join(e["text"] for e in evidence))
+        # 相近特性提示：当输入特性名不精确时，显式把候选相近特性给到模型
+        # 相近特性提示：仅当问题询问特性持有者但特性名非官方名称时才给提示；策略题不提示，避免误导模型
+        if use_graph and "特性" in question and not any(w in question for w in ("携带", "适合", "应对", "对策", "面对")):
+            if not any(f["label"] == "Ability" and f["data"].get("name") in question for f in facts):
+                guessed = self.graph.guess_ability(question)
+                if len(guessed) >= 2:
+                    context_parts.append(
+                        f"【相近特性提示】若输入特性名非官方规范名称（如“蓄水”），请结合上下文列出的相近特性（{'、'.join(guessed[:2])}）一并说明拥有它们的宝可梦。"
+                    )
 
         context = "\n\n".join(context_parts)
         prompt = self.prompt_template.format(
-            query_text=question, context=context, examples=""
+            query_text=question, context=context, examples=FEW_SHOT_EXAMPLES
         )
         resp = self.llm.invoke(prompt)
         return {
@@ -463,13 +592,11 @@ class PokemonGraphRAG:
         """索引自检快照：启动时打日志，/api/health 对外返回。"""
         names = [VECTOR_INDEX] + self.fulltext_indexes
         try:
-            records, _, _ = self.driver.execute_query(
+            rows = self.graph.run(
                 "SHOW INDEXES YIELD name, state WHERE name IN $names RETURN name, state",
-                {"names": names},
-                database_=self.db,
-                routing_=RoutingControl.READ,
+                names=names,
             )
-            states = {r["name"]: r["state"] for r in records}
+            states = {r["name"]: r["state"] for r in rows}
             warns = [f"索引缺失：{n}" for n in names if n not in states]
             warns += [f"索引未就绪：{n}（{s}）" for n, s in states.items() if s != "ONLINE"]
         except Exception as exc:

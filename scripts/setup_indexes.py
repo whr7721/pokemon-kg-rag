@@ -24,6 +24,13 @@ STEPS = [
     "CREATE VECTOR INDEX embedding_Chunk IF NOT EXISTS FOR (c:Chunk) ON (c.embedding) OPTIONS {indexConfig: {`vector.dimensions`: 1024, `vector.similarity_function`: 'cosine'}}",
     "CREATE CONSTRAINT pokemon_id IF NOT EXISTS FOR (p:Pokemon) REQUIRE p.pokedex_id IS UNIQUE",
     "CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.chunk_id IS UNIQUE",
+    "CREATE CONSTRAINT Pokemon_id IF NOT EXISTS FOR (p:Pokemon) REQUIRE p.id IS UNIQUE",
+    "CREATE CONSTRAINT Form_id IF NOT EXISTS FOR (f:Form) REQUIRE f.id IS UNIQUE",
+    "CREATE CONSTRAINT Move_id IF NOT EXISTS FOR (m:Move) REQUIRE m.id IS UNIQUE",
+    "CREATE CONSTRAINT Ability_id IF NOT EXISTS FOR (a:Ability) REQUIRE a.id IS UNIQUE",
+    "CREATE CONSTRAINT Type_id IF NOT EXISTS FOR (t:Type) REQUIRE t.id IS UNIQUE",
+    "CREATE CONSTRAINT EggGroup_id IF NOT EXISTS FOR (e:EggGroup) REQUIRE e.id IS UNIQUE",
+    "CREATE CONSTRAINT RegionDex_id IF NOT EXISTS FOR (r:RegionDex) REQUIRE r.id IS UNIQUE",
 ]
 
 
@@ -43,6 +50,8 @@ def main():
                 names=[
                     "pokemonFulltext", "abilityFulltext", "moveFulltext",
                     "formFulltext", "embedding_Chunk", "pokemon_id", "chunk_id",
+                    "Pokemon_id", "Form_id", "Move_id", "Ability_id",
+                    "Type_id", "EggGroup_id", "RegionDex_id",
                 ],
             )]
         print("已确认索引/约束:", ", ".join(names))

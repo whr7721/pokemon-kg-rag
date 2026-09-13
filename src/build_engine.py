@@ -177,12 +177,15 @@ class Builder:
         self.rel_chunks = []
         self._te_single = defaultdict(list)   # defender_type -> [(rows,pid)]
         self._te_variant = []                 # [(pid, form_tag, types, rows)] 特性变体表
+        self._te_profiles = {}                # pid -> (types, rows) 基础受击表
+        self._ability_ids = {}                # 特性名 -> id（用于区分特性变体表）
         self._evo_raw = []                    # (fid, chain)
         self.report = {"pokemon_files": 0, "forms": 0, "types_seen": Counter(),
                        "abilities_used": 0, "abilities_unresolved": set(),
                        "moves_used": 0, "moves_unresolved": set(),
                        "evo_unresolved": [], "type_chart_warns": [],
-                       "te_ability_variant": 0}
+                       "te_ability_variant": 0, "hit_profiles": 0,
+                       "hit_profile_warns": []}
 
     # -------- 通用 --------
     def add_rel(self, rtype, frm, to, props=None):
@@ -255,7 +258,24 @@ class Builder:
             "common_count": None, "hidden_count": None,
             "description": "", "effect": "", "placeholder": True,
             "text": f"特性：{name}（数据源占位，详情缺失）"})
+
         return self._ability_ids[name], name
+
+    def _is_ability_tag(self, tag):
+        """受击表 form 字段指向特性变体（而非形态简称）。
+
+        数据里 form 取值混杂：完整形态名（“草木蓑衣”）、形态简称（“草木”“洗翠”）、
+        特性名或括号注解（“毛茸茸”、“(避雷针)”）、形态+特性组合（“超级进化过滤”）。
+        只有后两类是特性变体表；误判成基础表会把带特性修正的倍率混进克制表投票。
+        """
+        if not tag:
+            return False
+        if any(c in tag for c in "()（）"):
+            return True
+        clean = tag.strip("*‡† \t")
+        if ABILITY_ALIAS.get(clean, clean) in self._ability_ids:
+            return True
+        return any(clean.endswith(ab) for ab in self._ability_ids if len(ab) >= 2)
 
     def build_move_entities(self):
         detail = {m["name_zh"]: m for m in self.L.iter_moves()}
@@ -399,11 +419,15 @@ class Builder:
                             for r in te.get("data", []) if r.get("type")]
                     if not rows:
                         continue
-                    if tform not in real_forms and tform != "一般":
+                    if (tform not in real_forms and tform != "一般"
+                            and self._is_ability_tag(tform)):
                         self.report["te_ability_variant"] += 1
                         if len(ttypes) == 1:
                             self._te_variant.append((pid, tform, ttypes[0], rows))
                         continue
+                    # 基础表：空 form（默认形态）优先，其余仅在尚无记录时采用
+                    if ttypes and (tform == "" or pid not in self._te_profiles):
+                        self._te_profiles[pid] = (tuple(ttypes), rows)
                     if len(ttypes) == 1:
                         self._te_single[ttypes[0]].append((rows, pid))
                 # --- 进化链原始信息（名称解析放收集阶段，链全量已在此文件内） ---
@@ -538,6 +562,54 @@ class Builder:
                 "member_count": member,
                 "text": f"地区图鉴：{name}，共收录 {member} 只宝可梦。"})
 
+    # ========= 受击倍率文本块（双属性直接取数据，不靠相乘） =========
+    def build_hit_profiles(self):
+        """每个宝可梦默认形态一条受击块。
+
+        数据的 type_effectiveness 对每个属性组合都给了完整 18 项倍率，双属性
+        无需查询端相乘；这里同时与单属性表相乘结果比对，记录不一致供核查。
+        """
+        for pid, (types, rows) in self._te_profiles.items():
+            name = self._names.get(pid)
+            if not name or not types:
+                continue
+            by_mult = defaultdict(list)
+            for att, dmg in rows:
+                try:
+                    mult = float(dmg)
+                except (TypeError, ValueError):
+                    continue
+                if mult != 1:
+                    by_mult[mult].append(att)
+            if not by_mult:
+                continue
+            parts = "；".join(
+                f"{m:g}倍[{'、'.join(sorted(set(v)))}]"
+                for m, v in sorted(by_mult.items(), reverse=True))
+            self.chunks.append({
+                "id": f"hitprofile|{pid}", "kind": "hit-profile",
+                "entity_label": "Pokemon", "entity_id": pid, "name_zh": name,
+                "text": f"{name}（{'/'.join(types)}）受到攻击时的伤害倍率：{parts}。",
+                "lang": "zh"})
+            self.report["hit_profiles"] += 1
+            if len(types) > 1:
+                bad = []
+                for att, dmg in rows:
+                    try:
+                        mult = float(dmg)
+                    except (TypeError, ValueError):
+                        continue
+                    calc = 1.0
+                    for t in types:
+                        base = self._chart.get((att, t))
+                        calc = None if base is None else calc * float(base)
+                        if calc is None:
+                            break
+                    if calc is not None and abs(calc - mult) > 1e-6:
+                        bad.append((att, mult, calc))
+                if bad:
+                    self.report["hit_profile_warns"].append((pid, bad[:5]))
+
     # ========= 名字表 + 文本负载 =========
     def build_name_table(self):
         self._names = {}
@@ -561,6 +633,9 @@ class Builder:
             core.add("LEARNS")
         for rtype, recs in self.relations.items():
             if rtype not in core:
+                continue
+            if rtype in ("LEARNS", "IN_DEX"):
+                self._append_overview_rel_chunks(rtype, recs)
                 continue
             for r in recs:
                 s, o = self.name_of(r["from"]), self.name_of(r["to"])
@@ -599,6 +674,34 @@ class Builder:
                         "method": r.get("method"), "hidden": r.get("hidden"),
                         "multiplier": r.get("multiplier"),
                         "text": sent, "lang": "zh"})
+
+    def _append_overview_rel_chunks(self, rtype, recs):
+        """LEARNS / IN_DEX 按主语聚合为概览句。
+
+        这两类逐边成句合计约 8.8 万条，全量入库会让向量语料膨胀近 3 倍；
+        其余关系仍逐边生成，兼顾“普通 RAG 看得到关系事实”与索引体积。
+        """
+        by_subject = defaultdict(list)
+        for r in recs:
+            by_subject[r["from"]].append(r)
+        for sub, rows in by_subject.items():
+            sname = self.name_of(sub)
+            if rtype == "LEARNS":
+                level = [r for r in rows if r.get("method") == "level"]
+                pool = sorted(level or rows,
+                              key=lambda r: num(re.sub(r"\D", "", str(r.get("label") or ""))))
+                names = [self.name_of(r["to"]) for r in pool][:20]
+                text = f"{sname} 的升级招式包括：{'、'.join(names)}。" if names else ""
+            else:
+                names = [f"{self.name_of(r['to'])}#{r.get('local_id')}" for r in rows][:20]
+                text = f"{sname} 收录于图鉴：{'、'.join(names)}。" if names else ""
+            if not text:
+                continue
+            self.rel_chunks.append({
+                "id": f"rel|{rtype}|{sub}|overview", "kind": "relation",
+                "relation": rtype, "subject": sub, "object": "",
+                "subject_name": sname, "object_name": "",
+                "text": text, "lang": "zh"})
 
     # ========= 输出 =========
     def write_all(self):
@@ -657,6 +760,8 @@ class Builder:
             "te_ability_variant_rows": self.report["te_ability_variant"],
             "type_chart_edges": len(self.relations["HITS_TYPE"]),
             "type_chart_warns": self.report["type_chart_warns"][:20],
+            "hit_profiles": self.report["hit_profiles"],
+            "hit_profile_warns": self.report["hit_profile_warns"][:20],
             "entities_total": {k: len(v) for k, v in self.entities.items()},
             "relations_total": {k: len(v) for k, v in self.relations.items()},
             "entity_chunks": len(self.chunks),
@@ -760,6 +865,7 @@ def main():
 
     print("[6/7] 检索文本块 ...")
     b.build_name_table(); b.build_chunks()
+    b.build_hit_profiles()
 
     print("[7/7] 输出 ...")
     b.write_all()

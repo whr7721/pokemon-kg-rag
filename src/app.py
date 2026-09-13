@@ -51,5 +51,42 @@ def ask():
     return jsonify(router.answer(question, top_k=top_k, use_graph=use_graph))
 
 
+@app.get("/api/entity")
+def entity_detail():
+    label = (request.args.get("label") or "").strip()
+    name = (request.args.get("name") or "").strip()
+    if not label or not name:
+        return jsonify({"error": "label and name are required"}), 400
+    detail = router.graph.entity_detail(label, name)
+    if detail is None:
+        return jsonify({"error": "entity not found"}), 404
+    return jsonify(detail)
+
+
+@app.post("/api/compare")
+def compare():
+    data = request.get_json(silent=True) or {}
+    question = (data.get("question") or "").strip()
+    if not question:
+        return jsonify({"error": "question is required"}), 400
+    top_k = int(data.get("top_k", 8))
+    naive = router.rag.ask(question, top_k=top_k, use_graph=False)
+    graph = router.rag.ask(question, top_k=top_k, use_graph=True)
+    return jsonify({
+        "question": question,
+        "naive": {
+            "answer": naive["answer"],
+            "evidence": naive["evidence"],
+            "facts": naive.get("facts", []),
+            "subgraph": router.rag.subgraph(naive["evidence"], limit=3),
+        },
+        "graph": {
+            "answer": graph["answer"],
+            "evidence": graph["evidence"],
+            "facts": graph.get("facts", []),
+            "subgraph": router.rag.subgraph(graph["evidence"], limit=3),
+        },
+    })
+
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=False)
