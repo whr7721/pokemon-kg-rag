@@ -1,25 +1,19 @@
 # 项目进度
 
 ## 当前状态
-- 阶段：第一阶段（9/10 汇报）
-- 分支：`master`（由 `stage1-final` review 后合入）
-- 状态：阶段一最终基线已打 tag `v0.6-stage1`；组内 Aura 已完成增强 Schema 入库并补齐 DESCRIBES；检索/直答冒烟通过
+- 阶段：第二阶段（9/15 汇报）
+- 分支：`stage2-final`（成员一/二/三分支整合 + 成员四前端补齐 + 成员五架构收口）
+- 状态：代码层面二阶段最终版；评测结果与最终代码口径仍需最后核对
 
-## 阶段一已完成能力
-1. 确定性图谱：Pokemon 1025 / Form 1320 / Move 935 / Ability 318 / Type 18 / EggGroup 16 / RegionDex 24 / Chunk 30728
-2. 关系：LEARNS 82833 / HAS_ABILITY 2866 / HAS_TYPE 2064 / IN_EGG_GROUP 1671 / EVOLVES_TO 485 / HITS_TYPE 324 / TYPE_MOD 22 / IN_DEX 5973 / DESCRIBES 30728
-3. 文本块：30728 个 entity Chunk（导入按 chunk_id 去重；每个块经 DESCRIBES 指向实体）
-   - 建库产物的原始计数为 entity_chunks 30781 / Ability 322 / Move 953；写入 Neo4j 时按节点 id 去重后变为 Chunk 30728 / Ability 318 / Move 935。
-4. 已合入 `feat/frontend`：示例问题、loading、错误提示、子图节点配色/图例
-5. 本地 BGE-M3 向量化、向量索引/约束脚本
-6. 实体邻域图谱事实注入（GraphRAG 模式），支持 `use_graph=false` 对照普通 RAG
-7. 结构化直答路由：进化、克制、特性、策略；`/test` 自测页
-8. 成员三评测：5 个代表问题普通 RAG vs GraphRAG 实测报告
+## 阶段二已合入能力
+1. 成员一（数据与图谱）：唯一约束补齐、双属性受击块（hit-profile）、LEARNS/IN_DEX 关系块聚合、`scripts/check_quality.py` 质量门槛
+2. 成员二（向量与检索）：混合检索（向量 + 全文 + RRF）、PolyG 查询规划、PathRAG 进化证据路径、KG²RAG 图扩展、消融与调参脚本
+3. 成员三（生成与评测）：22 题三路评测、few-shot 与防幻觉 Prompt、`run_eval.py` / `score_eval.py`
+4. 成员四（应用与前端）：GraphRAG/对照模式切换、模式徽标、子图节点点击查看详情、`/api/compare` 与 `/api/entity`
+5. 成员五（架构与集成）：统一 `GraphAccess` 图访问层、`RagRouter` 路由、三成员分支整合
 
-## 待验证/待办（见 docs/stage1-integration.md）
-- [x] 组内 Aura 使用 `python scripts/load_engine_out.py --clean` 完成一次增强 Schema 重建
-- [x] 重跑 `scripts/embed_vectors.py`、`setup_indexes.py`、`check_graph.py`
-- [x] 重跑 `smoke_rag.py`、`smoke_multiqa.py`（14/14）、`smoke_ask.py`
-- [ ] 用最终库重跑 `compare_rag.py` 并把最后一轮答案写进 `docs/evaluation.md`
-- [x] 本地 `.env` 已修正（`.env` 不入库）
-- [x] 小组已 review `stage1-final`，合入 `master` 并打 tag `v0.6-stage1`
+## 待办（9/15 前）
+- [ ] 用最终整合代码重跑 `scripts/run_eval.py` + `scripts/score_eval.py`，让评测结果与最终混合检索一致
+- [ ] `docs/evaluation.md` 与最终代码口径对齐
+- [ ] README、架构图、演示脚本、汇报 PPT（成员五）
+- [ ] 最终核对后打 tag `v1.0-stage2`
