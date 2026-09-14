@@ -38,6 +38,12 @@
   /* 子图节点类型图例 */
   .legend { display:flex; flex-wrap:wrap; gap:14px; padding:6px 2px 10px; font-size:12px; color:var(--muted); }
   .legend i { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:4px; vertical-align:-1px; }
+  /* 当前问答模式徽章：结构化直答 / GraphRAG / 普通RAG */
+  .mode { display:inline-block; margin-left:8px; padding:2px 10px; border-radius:999px; font-size:12px; font-weight:600; vertical-align:1px; }
+  .mode.struct { background:#ecfdf5; color:#047857; border:1px solid #a7f3d0; }
+  .mode.graph { background:#eff6ff; color:#1d4ed8; border:1px solid #bfdbfe; }
+  .mode.naive { background:#f3f4f6; color:#4b5563; border:1px solid #e5e7eb; }
+  .mode[hidden] { display:none; }
 </style>
 </head>
 <body>
@@ -55,7 +61,7 @@
     <div class="chips" id="chips" style="margin-top:10px;"></div>
   </div>
   <div class="panel">
-    <h2>回答</h2>
+    <h2>回答 <span id="mode" class="mode" hidden></span></h2>
     <div id="answer">请输入问题，或点击下方示例问题快速体验。</div>
   </div>
   <div class="grid">
@@ -106,6 +112,13 @@ function drawGraph(sg){
 }
 function showError(msg){ document.getElementById('errtext').textContent=msg; document.getElementById('errbar').hidden=false; }
 function hideError(){ document.getElementById('errbar').hidden=true; }
+/* 模式徽章：mode 字段由后端路由返回——结构化 kind / graph_rag / naive_rag */
+const MODE_META={graph_rag:['graph','GraphRAG 检索增强'],naive_rag:['naive','普通 RAG']};
+function setMode(m){
+  const el=document.getElementById('mode');
+  const meta=MODE_META[m]||['struct','结构化直答'];
+  el.className='mode '+meta[0]; el.textContent=meta[1]; el.hidden=false;
+}
 document.getElementById('errclose').onclick=hideError;
 /* 示例问题：覆盖属性/招式/特性/进化/克制五类，与评测问题集对齐 */
 const EXAMPLES=[
@@ -129,6 +142,7 @@ async function ask(){
   const btn=document.getElementById('go'), ans=document.getElementById('answer'), ev=document.getElementById('evidence');
   btn.disabled=true; btn.textContent='查询中…';
   hideError();
+  document.getElementById('mode').hidden=true;
   ans.innerHTML='<span class="spin"></span>正在检索知识图谱并生成回答，约需数秒…';
   ev.innerHTML='';
   drawGraph(null);
@@ -139,6 +153,7 @@ async function ask(){
     if(!res.ok) throw new Error('服务返回 '+res.status);
     const data=await res.json();
     if(data.error) throw new Error(data.error);
+    setMode(data.mode);
     ans.textContent=data.answer || '无回答';
     (data.evidence||[]).forEach(e=>{
       const d=document.createElement('div'); d.className='evi';
