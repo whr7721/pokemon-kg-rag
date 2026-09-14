@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>宝可梦多格式问答 · 自测</title>
+<style>
+  :root { --bd:#d0d7de; --bg:#f6f8fa; --fg:#1f2328; --ok:#1a7f37; --bad:#cf222e; }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC","Microsoft YaHei",system-ui,sans-serif; margin:0; background:var(--bg); color:var(--fg); }
+  header { padding:14px 20px; background:#24292f; color:#fff; }
+  header h1 { font-size:18px; margin:0; }
+  main { max-width:760px; margin:20px auto; padding:0 16px; }
+  .box { background:#fff; border:1px solid var(--bd); border-radius:8px; padding:16px; margin-bottom:16px; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+  .chip { border:1px solid var(--bd); background:#fff; border-radius:16px; padding:5px 12px; font-size:13px; cursor:pointer; }
+  .chip:hover { background:#eef1f4; }
+  .ask-row { display:flex; gap:8px; }
+  input#q { flex:1; padding:9px 12px; font-size:15px; border:1px solid var(--bd); border-radius:6px; }
+  button { padding:9px 18px; font-size:15px; border:0; border-radius:6px; background:#1f6feb; color:#fff; cursor:pointer; }
+  button:disabled { opacity:.6; cursor:default; }
+  .mode { display:inline-block; font-size:12px; padding:2px 10px; border-radius:12px; background:#ddf4ff; color:#0969da; }
+  .mode.evolution { background:#fff8c5; color:#9a6700; }
+  .mode.counter { background:#dafbe1; color:#1a7f37; }
+  .mode.relation { background:#ffebe9; color:#cf222e; }
+  .answer { white-space:pre-wrap; line-height:1.7; }
+  .meta { color:#57606a; font-size:12px; margin-top:8px; }
+  .err { color:var(--bad); white-space:pre-wrap; }
+  footer { color:#57606a; font-size:12px; text-align:center; margin:20px; }
+</style>
+</head>
+<body>
+<header><h1>宝可梦多格式问答 · 自测页面</h1></header>
+<main>
+  <div class="box">
+    <div class="chips" id="chips"></div>
+    <div class="ask-row">
+      <input id="q" placeholder="输入问题，如：什么宝可梦克制阿柏怪？" />
+      <button id="btn">提问</button>
+    </div>
+  </div>
+  <div class="box" id="result" style="display:none">
+    <div id="head"></div>
+    <div class="answer" id="answer"></div>
+    <div class="meta" id="meta"></div>
+    <div class="err" id="err"></div>
+  </div>
+  <footer>结构化题走图查询（进化/克制/关系）；开放题回落 GraphRAG。数据：组内增强 Schema · /api/ask</footer>
+</main>
+<script>
+const EXAMPLES = [
+  "妙蛙种子最终进化成什么？",
+  "耿鬼是怎么进化出来的？",
+  "伊布可以进化成哪些宝可梦？条件分别是什么？",
+  "什么宝可梦克制阿柏怪？",
+  "皮卡丘怕什么属性？",
+  "什么宝可梦能克制妙蛙种子？",
+  "烈咬陆鲨被什么4倍克制？",
+  "饭匙蛇和猫鼬斩是什么关系？",
+  "谁捕食铁蚁？",
+  "皮卡丘是什么属性的宝可梦？",
+];
+const MODE_CN = { evolution:"进化", counter:"克制", relation:"关系", ability:"特性", suggest:"建议", rag:"RAG(开放)" };
+
+const chips = document.getElementById("chips");
+EXAMPLES.forEach((q) => {
+  const b = document.createElement("button");
+  b.className = "chip"; b.textContent = q; b.type = "button";
+  b.onclick = () => { document.getElementById("q").value = q; ask(); };
+  chips.appendChild(b);
+});
+
+async function ask() {
+  const q = document.getElementById("q").value.trim();
+  if (!q) return;
+  const btn = document.getElementById("btn");
+  btn.disabled = true; btn.textContent = "…";
+  const box = document.getElementById("result");
+  box.style.display = "block";
+  document.getElementById("err").textContent = "";
+  try {
+    const r = await fetch("/api/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: q, top_k: 8 }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.status);
+    const mode = d.mode || "rag";
+    document.getElementById("head").innerHTML =
+      `<span class="mode ${mode}">${MODE_CN[mode] || mode}</span>`;
+    document.getElementById("answer").textContent = d.answer || "(无回答)";
+    const ev = (d.evidence || []).length;
+    document.getElementById("meta").textContent =
+      d.mode === "rag" ? `模式：RAG（证据 ${ev} 条 / 子图 ${(d.subgraph?.nodes||[]).length} 点）`
+                       : `模式：图查询直答（结构化：${mode}）`;
+  } catch (e) {
+    document.getElementById("err").textContent = "请求失败：" + String(e.message || e);
+  } finally {
+    btn.disabled = false; btn.textContent = "提问";
+  }
+}
+document.getElementById("btn").onclick = ask;
+document.getElementById("q").addEventListener("keydown", (e) => { if (e.key === "Enter") ask(); });
+</script>
+</body>
+</html>
